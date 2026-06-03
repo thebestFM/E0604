@@ -2,7 +2,7 @@ __pycache__/
 # *.log
 *.db
 result*/
-data/*
+# data/*
 *yml
 *txt
 # logs*
