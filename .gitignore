@@ -3,6 +3,6 @@ __pycache__/
 *.db
 result*/
 # data/*
-*yml
-*txt
+# *yml
+# *txt
 # logs*
