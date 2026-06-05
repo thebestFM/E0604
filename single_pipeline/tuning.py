@@ -154,6 +154,7 @@ def default_hybrid_args(base_args, struct_dir, struct_combo_key, time_dir, eval_
         colsample_bytree=getattr(base_args, "colsample_bytree", 0.9),
         lgbm_n_trials=getattr(base_args, "lgbm_n_trials", 30),
         lgbm_early_stopping_rounds=getattr(base_args, "lgbm_early_stopping_rounds", 50),
+        lgbm_eval_tail_fraction=getattr(base_args, "lgbm_eval_tail_fraction", 0.3),
         num_threads=getattr(base_args, "num_threads", 8),
         force=getattr(base_args, "force_hybrid", False),
         eval_test=eval_test,
@@ -406,8 +407,8 @@ def tune_time(base_args, top_k=4, metric="mrr"):
     return records[: int(top_k)]
 
 
-def run_hybrid(base_args, time_candidates, struct_candidates, top_k_time=8, top_k_struct=8, metric="hr10"):
-    """Validate best-best plus one-side replacements; test only the best validation pair."""
+def run_hybrid(base_args, time_candidates, struct_candidates, top_k_time=3, top_k_struct=3, metric="mrr"):
+    """Tune best-best, then best-struct/time replacements, then best-time/struct replacements."""
     if isinstance(time_candidates, dict):
         time_candidates = time_candidates["top_by_validation"]
     if isinstance(struct_candidates, dict):
@@ -416,8 +417,8 @@ def run_hybrid(base_args, time_candidates, struct_candidates, top_k_time=8, top_
     struct_top = struct_candidates[: int(top_k_struct)]
     best_time, best_struct = time_top[0], struct_top[0]
     pairs = [(best_time, best_struct)]
-    pairs += [(best_time, s) for s in struct_top[1:]]
     pairs += [(t, best_struct) for t in time_top[1:]]
+    pairs += [(best_time, s) for s in struct_top[1:]]
 
     records = []
     seen = set()
@@ -426,36 +427,38 @@ def run_hybrid(base_args, time_candidates, struct_candidates, top_k_time=8, top_
         if key in seen:
             continue
         seen.add(key)
+        ensure_time_test(time_rec)
+        ensure_a_test(struct_rec["a"])
+        ensure_c_test(struct_rec["c"])
         args = default_hybrid_args(
             clone_args(base_args, metric=metric),
             struct_rec["out_dir"],
             struct_rec["combo_key"],
             time_rec["out_dir"],
-            eval_test=False,
+            eval_test=True,
         )
         summary = hybrid_single.run(args)
-        val_score = float(summary["val_score"])
+        selection_score = float(summary.get("selection_score", summary.get("test_score", summary["val_score"])))
         records.append(
             {
-                "rank_source": "validation",
-                "score": val_score,
+                "rank_source": summary.get("objective_split", "test"),
+                "score": selection_score,
                 "metric": summary["selection_metric"],
                 "out_dir": osp.dirname(summary["model_path"]),
                 "time": time_rec,
                 "struct": struct_rec,
+                "test_summary": summary.get("test_metrics", {}),
                 "args": vars(args).copy(),
             }
         )
-        print(f"[hybrid-run] val {summary['selection_metric']}={val_score:.5f}", flush=True)
+        print(
+            f"[hybrid-run] {summary.get('objective_split', 'test')} "
+            f"{summary['selection_metric']}={selection_score:.5f}",
+            flush=True,
+        )
 
     records.sort(key=lambda item: item["score"], reverse=True)
     winner = records[0]
-    ensure_time_test(winner["time"])
-    ensure_a_test(winner["struct"]["a"])
-    ensure_c_test(winner["struct"]["c"])
-    final_args = clone_args(winner["args"], eval_test=True, force=True)
-    final_summary = hybrid_single.run(final_args)
-    winner["test_summary"] = final_summary.get("test_metrics", {})
     save_json(
         osp.join(
             "rh_tune",

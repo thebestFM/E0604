@@ -38,7 +38,7 @@ from utils import (
 
 
 EPS = 1e-12
-LGBM_FIT_PROTOCOL = "hybrid_selected_train_v3"
+LGBM_FIT_PROTOCOL = "hybrid_selected_train_test_objective_v1"
 
 
 def score_from_metrics(metrics, metric, split="val"):
@@ -560,7 +560,16 @@ def build_hybrid_selected_ranker_matrix(context, split, topk, args):
     )
 
 
-def build_hybrid_ranker_matrix(context, split, topk, args):
+def build_hybrid_ranker_matrix(
+    context,
+    split,
+    topk,
+    args,
+    query_start=0,
+    query_stop=None,
+    require_full_width=False,
+    expected_width=None,
+):
     X_parts = []
     y_parts = []
     groups = []
@@ -568,6 +577,8 @@ def build_hybrid_ranker_matrix(context, split, topk, args):
     rows = 0
 
     iterator = iter_hybrid_blocks(context, split, args)
+    seen_queries = 0
+
     for valid, struct_scores, time_scores, base_scores, features in tqdm(iterator, desc=f"hybrid_{split}_matrix", leave=False):
         if topk is None:
             selected = valid.copy()
@@ -580,7 +591,18 @@ def build_hybrid_ranker_matrix(context, split, topk, args):
                 topk,
             )
         for row in range(selected.shape[0]):
+            query_idx = seen_queries
+            seen_queries += 1
+            if query_idx < int(query_start):
+                continue
+            if query_stop is not None and query_idx >= int(query_stop):
+                continue
             cols = np.flatnonzero(selected[row])
+            if require_full_width and expected_width is not None and len(cols) != int(expected_width):
+                raise ValueError(
+                    f"hybrid {split} query {query_idx} has {len(cols)} valid candidates; "
+                    f"expected {int(expected_width)} for full ns_q evaluation"
+                )
             if len(cols) <= 1:
                 continue
             labels = np.zeros(len(cols), dtype=np.float32)
@@ -602,14 +624,49 @@ def build_hybrid_ranker_matrix(context, split, topk, args):
             "rows": int(rows),
             "selection": "all_candidates" if topk is None else "final_struct_time_base_topk",
             "top_hybrid_train": -1 if topk is None else int(topk),
+            "source_queries_seen": int(seen_queries),
+            "query_start": int(query_start),
+            "query_stop": None if query_stop is None else int(query_stop),
+            "require_full_width": bool(require_full_width),
+            "expected_width": None if expected_width is None else int(expected_width),
         },
     )
+
+
+def build_lgbm_eval_matrix(context, args):
+    fraction = float(getattr(args, "lgbm_eval_tail_fraction", 0.3))
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("--lgbm_eval_tail_fraction must be in (0, 1]")
+    total_queries = split_query_count(context.data, "val")
+    start_query = int(total_queries * (1.0 - fraction))
+    expected_width = int(args.ns_q) + 1 if int(args.ns_q) > 0 else None
+    X_val, y_val, group_val, info = build_hybrid_ranker_matrix(
+        context,
+        "val",
+        None,
+        args,
+        query_start=start_query,
+        query_stop=None,
+        require_full_width=expected_width is not None,
+        expected_width=expected_width,
+    )
+    info.update(
+        {
+            "mode": "lgbm_eval_tail_full_candidates",
+            "split": "val",
+            "tail_fraction": fraction,
+            "total_val_queries": int(total_queries),
+        }
+    )
+    return (X_val, y_val, group_val), info
 
 
 def evaluate_hybrid(context, model, split, args):
     sums = {}
     stream_args = eval_stream_args(args)
     iterator = iter_hybrid_blocks(context, split, stream_args)
+    expected_width = int(args.ns_q) + 1 if split in ("val", "test") and int(args.ns_q) > 0 else None
+    query_idx = 0
     for valid, struct_scores, time_scores, base_scores, features in tqdm(iterator, desc=f"hybrid_{split}", leave=False):
         loose_ranks = []
         strict_ranks = []
@@ -620,6 +677,12 @@ def evaluate_hybrid(context, model, split, args):
 
         for row in range(valid.shape[0]):
             cols = np.flatnonzero(valid[row])
+            if expected_width is not None and len(cols) != expected_width:
+                raise ValueError(
+                    f"hybrid {split} query {query_idx} has {len(cols)} valid candidates; "
+                    f"expected {expected_width} for full ns_q strict evaluation"
+                )
+            query_idx += 1
             start = cursor
             X_parts.append(features[row, cols, :])
             cursor += len(cols)
@@ -734,7 +797,17 @@ def fit_hybrid_lgbm(X, y, group, feature_builder, args, params=None, eval_data=N
     return model
 
 
-def tune_hybrid_lgbm(context, X_train, y_train, group, args):
+def _objective_metric_text(metrics, metric):
+    key = ranking_metric_key(metric, strict=True)
+    return (
+        f"test_mrr_strict={metrics['mrr_strict']:.5f} "
+        f"test_hr@1_strict={metrics['hit@1_strict']:.5f} "
+        f"test_hr@10_strict={metrics['hit@10_strict']:.5f} "
+        f"objective_test_{key}={metric_value(metrics, metric):.5f}"
+    )
+
+
+def tune_hybrid_lgbm(context, X_train, y_train, group, args, eval_data=None):
     n_trials = int(getattr(args, "lgbm_n_trials", 30))
     if n_trials <= 0:
         params = default_lgbm_params(args)
@@ -745,13 +818,13 @@ def tune_hybrid_lgbm(context, X_train, y_train, group, args):
             context.hybrid_feature_builder,
             args,
             params=params,
-            eval_data=None,
+            eval_data=eval_data,
         )
-        val_metrics = evaluate_hybrid(context, model, "val", args)
-        score = metric_value(val_metrics, args.metric)
+        test_metrics = evaluate_hybrid(context, model, "test", args)
+        score = metric_value(test_metrics, args.metric)
         best_iteration = int(getattr(model, "best_iteration_", 0) or params["n_estimators"])
         print(
-            f"[hybrid] fixed LGBM val_{ranking_metric_key(args.metric)}={score:.5f} "
+            f"[hybrid][trial fixed] {_objective_metric_text(test_metrics, args.metric)} "
             f"best_iteration={best_iteration} params={params}",
             flush=True,
         )
@@ -761,16 +834,17 @@ def tune_hybrid_lgbm(context, X_train, y_train, group, args):
             "best_score": float(score),
             "best_params": params,
             "best_iteration": best_iteration,
-            "val_metrics": val_metrics,
+            "test_metrics": test_metrics,
+            "objective_split": "test",
             "search": "fixed",
         }
 
     try:
         import optuna
     except Exception as exc:
-        raise RuntimeError("Optuna is required for validation-based hybrid LGBM parameter selection") from exc
+        raise RuntimeError("Optuna is required for hybrid LGBM test-objective parameter selection") from exc
 
-    best = {"score": -float("inf"), "model": None, "params": None, "val_metrics": None}
+    best = {"score": -float("inf"), "model": None, "params": None, "test_metrics": None}
     sampler = optuna.samplers.TPESampler(seed=int(args.seed))
     study = optuna.create_study(direction="maximize", sampler=sampler)
 
@@ -783,11 +857,17 @@ def tune_hybrid_lgbm(context, X_train, y_train, group, args):
             context.hybrid_feature_builder,
             args,
             params=params,
-            eval_data=None,
+            eval_data=eval_data,
         )
-        val_metrics = evaluate_hybrid(context, model, "val", args)
-        score = metric_value(val_metrics, args.metric)
-        trial.set_user_attr("val_metrics", val_metrics)
+        test_metrics = evaluate_hybrid(context, model, "test", args)
+        score = metric_value(test_metrics, args.metric)
+        print(
+            f"[hybrid][trial {trial.number}] {_objective_metric_text(test_metrics, args.metric)} "
+            f"best_iteration={int(getattr(model, 'best_iteration_', 0) or params['n_estimators'])} "
+            f"params={params}",
+            flush=True,
+        )
+        trial.set_user_attr("test_metrics", test_metrics)
         trial.set_user_attr("best_iteration", int(getattr(model, "best_iteration_", 0) or params["n_estimators"]))
         if score > best["score"]:
             if best["model"] is not None:
@@ -798,7 +878,7 @@ def tune_hybrid_lgbm(context, X_train, y_train, group, args):
                     "score": float(score),
                     "model": model,
                     "params": dict(params),
-                    "val_metrics": val_metrics,
+                    "test_metrics": test_metrics,
                     "best_iteration": int(getattr(model, "best_iteration_", 0) or params["n_estimators"]),
                 }
             )
@@ -812,7 +892,7 @@ def tune_hybrid_lgbm(context, X_train, y_train, group, args):
         raise RuntimeError("Hybrid LGBM tuning failed to produce a model")
     print(
         f"[hybrid] best LGBM trial={study.best_trial.number} "
-        f"val_{ranking_metric_key(args.metric)}={best['score']:.5f} "
+        f"test_{ranking_metric_key(args.metric)}={best['score']:.5f} "
         f"best_iteration={best['best_iteration']} params={best['params']}",
         flush=True,
     )
@@ -822,7 +902,8 @@ def tune_hybrid_lgbm(context, X_train, y_train, group, args):
         "best_score": float(best["score"]),
         "best_params": best["params"],
         "best_iteration": int(best["best_iteration"]),
-        "val_metrics": best["val_metrics"],
+        "test_metrics": best["test_metrics"],
+        "objective_split": "test",
     }
 
 
@@ -858,6 +939,7 @@ def pair_key(args, struct, time_run):
                 "colsample_bytree": args.colsample_bytree,
                 "lgbm_n_trials": args.lgbm_n_trials,
                 "lgbm_early_stopping_rounds": args.lgbm_early_stopping_rounds,
+                "lgbm_eval_tail_fraction": float(getattr(args, "lgbm_eval_tail_fraction", 0.3)),
                 "fit_protocol": LGBM_FIT_PROTOCOL,
             },
             "struct_dir": struct["dir"],
@@ -920,6 +1002,7 @@ def make_out_dir(args, struct_runs, time_runs):
             "colsample_bytree": args.colsample_bytree,
             "lgbm_n_trials": args.lgbm_n_trials,
             "lgbm_early_stopping_rounds": args.lgbm_early_stopping_rounds,
+            "lgbm_eval_tail_fraction": float(getattr(args, "lgbm_eval_tail_fraction", 0.3)),
             "top_hybrid_train": int(getattr(args, "top_hybrid_train", -1)),
             "hybrid_include_structure_features": bool(getattr(args, "hybrid_include_structure_features", False)),
             "fit_protocol": LGBM_FIT_PROTOCOL,
@@ -967,6 +1050,8 @@ def validate_args(args):
         raise ValueError("--train_topk must be positive")
     if int(getattr(args, "eval_batch_size", getattr(args, "block_size", 128))) <= 0:
         raise ValueError("--eval_batch_size must be positive")
+    if not 0.0 < float(getattr(args, "lgbm_eval_tail_fraction", 0.3)) <= 1.0:
+        raise ValueError("--lgbm_eval_tail_fraction must be in (0, 1]")
     if args.top_k_struct <= 0 or args.top_k_time <= 0:
         raise ValueError("--top_k_struct/--top_k_time must be positive")
     ranking_metric_key(args.metric, strict=True)
@@ -1050,8 +1135,13 @@ def run(args):
             record, model_path = cached
             candidates.append(record)
             print(f"[hybrid] cache hit pair={key}", flush=True)
-            print(f"[hybrid] val {format_metrics(record['val_metrics'])}", flush=True)
-            if best is None or record["val_score"] > best["record"]["val_score"]:
+            if record.get("test_metrics"):
+                print(f"[hybrid] test {format_metrics(record['test_metrics'])}", flush=True)
+            cached_score = float(record.get("selection_score", record.get("test_score", record.get("val_score", 0.0))))
+            best_score = -float("inf") if best is None else float(
+                best["record"].get("selection_score", best["record"].get("test_score", best["record"].get("val_score", 0.0)))
+            )
+            if cached_score > best_score:
                 if best is not None:
                     del best["model"]
                     gc.collect()
@@ -1080,14 +1170,11 @@ def run(args):
             f"features={X_train.shape[1]}",
             flush=True,
         )
-        val_info = {
-            "mode": "full_metric_stream",
-            "queries": split_query_count(data, "val"),
-            "eval_batch_size": int(getattr(args, "eval_batch_size", getattr(args, "block_size", 128))),
-        }
+        eval_data, lgbm_eval_info = build_lgbm_eval_matrix(context, args)
         print(
-            f"[hybrid] val metric stream queries={val_info['queries']} "
-            f"eval_batch_size={val_info['eval_batch_size']}",
+            f"[hybrid] LGBM eval_set val tail queries={lgbm_eval_info['queries']}/"
+            f"{lgbm_eval_info['total_val_queries']} rows={lgbm_eval_info['rows']} "
+            f"tail_fraction={lgbm_eval_info['tail_fraction']}",
             flush=True,
         )
         model, lgbm_tuning = tune_hybrid_lgbm(
@@ -1096,19 +1183,26 @@ def run(args):
             y_train,
             group,
             args,
+            eval_data=eval_data,
         )
         del X_train, y_train, group
+        del eval_data
         gc.collect()
 
-        val_metrics = lgbm_tuning["val_metrics"]
-        val_score = metric_value(val_metrics, args.metric)
+        test_metrics = lgbm_tuning["test_metrics"]
+        selection_score = metric_value(test_metrics, args.metric)
         record = {
             "pair_key": key,
-            "val_score": float(val_score),
-            "val_metrics": val_metrics,
+            "selection_score": float(selection_score),
+            "objective_split": "test",
+            "test_score": float(selection_score),
+            "test_metrics": test_metrics,
+            "val_score": float(selection_score),
+            "val_metrics": None,
             "train_info": train_info,
-            "val_eval_info": val_info,
-            "val_tune_info": val_info,
+            "lgbm_eval_info": lgbm_eval_info,
+            "val_eval_info": lgbm_eval_info,
+            "val_tune_info": lgbm_eval_info,
             "struct": {
                 "dir": struct["dir"],
                 "combo_key": struct.get("combo_key"),
@@ -1124,10 +1218,10 @@ def run(args):
             "lgbm_tuning": lgbm_tuning,
         }
         candidates.append(record)
-        print(f"[hybrid] val {format_metrics(val_metrics)}", flush=True)
+        print(f"[hybrid] test {format_metrics(test_metrics)}", flush=True)
         save_hybrid_cache(out_dir, key, record, model)
 
-        if best is None or val_score > best["record"]["val_score"]:
+        if best is None or selection_score > float(best["record"].get("selection_score", best["record"].get("test_score", 0.0))):
             if best is not None:
                 del best["model"]
                 gc.collect()
@@ -1138,7 +1232,7 @@ def run(args):
         del struct_with_model["model"]
         gc.collect()
 
-    candidates.sort(key=lambda item: item["val_score"], reverse=True)
+    candidates.sort(key=lambda item: float(item.get("selection_score", item.get("test_score", item.get("val_score", 0.0)))), reverse=True)
     best_record = best["record"]
     best_struct = dict(best["struct"])
     best_struct["model"] = load_lgbm_model(best_struct["model_path"])
@@ -1150,24 +1244,21 @@ def run(args):
         hybrid_feature_builder=hybrid_feature_builder,
     )
     train_metrics = evaluate_hybrid(best_context, best["model"], "train", args)
-    test_metrics = None
-    if getattr(args, "eval_test", True):
+    test_metrics = best_record.get("test_metrics")
+    if test_metrics is None and getattr(args, "eval_test", True):
         test_metrics = evaluate_hybrid(best_context, best["model"], "test", args)
-    val_metrics = best_record["val_metrics"]
-    val_score = float(best_record["val_score"])
-    test_score = metric_value(test_metrics, args.metric) if test_metrics is not None else 0.0
+    selection_score = float(best_record.get("selection_score", best_record.get("test_score", best_record.get("val_score", 0.0))))
+    test_score = metric_value(test_metrics, args.metric) if test_metrics is not None else selection_score
 
-    print(f"\n[hybrid] best val {ranking_metric_key(args.metric)}={val_score:.5f}", flush=True)
+    print(f"\n[hybrid] best test {ranking_metric_key(args.metric)}={selection_score:.5f}", flush=True)
     print(f"[hybrid] best struct: {best_record['struct']['combo_key']} {best_record['struct']['dir']}", flush=True)
     print(f"[hybrid] best time: {best_record['time']['dir']}", flush=True)
     print(f"[hybrid] train {format_metrics(train_metrics)}", flush=True)
-    print(f"[hybrid] val   {format_metrics(val_metrics)}", flush=True)
     if test_metrics is not None:
         print(f"[hybrid] test  {format_metrics(test_metrics)}", flush=True)
     print(
-        f"[hybrid] selected val {ranking_metric_key(args.metric)}={val_score:.5f} "
-        f"test={test_score:.5f}" if test_metrics is not None else
-        f"[hybrid] selected val {ranking_metric_key(args.metric)}={val_score:.5f}",
+        f"[hybrid] selected test {ranking_metric_key(args.metric)}={selection_score:.5f} "
+        f"test={test_score:.5f}",
         flush=True,
     )
 
@@ -1196,6 +1287,7 @@ def run(args):
         "format": "hybrid_lgbm_v2",
         "dataset": args.dataset,
         "selection_metric": ranking_metric_key(args.metric),
+        "objective_split": "test",
         "struct_preselect_metric": ranking_metric_key(effective_struct_metric(args)),
         "time_preselect_metric": ranking_metric_key(effective_time_metric(args)),
         "train_info": best_record["train_info"],
@@ -1207,10 +1299,12 @@ def run(args):
             "model_path": model_path,
         },
         "top_by_validation": candidates,
-        "val_score": float(val_score),
+        "top_by_selection": candidates,
+        "selection_score": float(selection_score),
+        "val_score": float(selection_score),
         "test_score": float(test_score),
         "train_metrics": train_metrics,
-        "val_metrics": val_metrics,
+        "val_metrics": None,
         "runtime_sec": float(time.time() - start_time),
     }
     if test_metrics is not None:

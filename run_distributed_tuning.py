@@ -65,6 +65,7 @@ def search_payload(args):
         "ignore_val_structure_combine": bool(getattr(args, "ignore_val_structure_combine", False)),
         "lgbm_n_trials": int(args.lgbm_n_trials),
         "lgbm_early_stopping_rounds": int(args.lgbm_early_stopping_rounds),
+        "lgbm_eval_tail_fraction": float(getattr(args, "lgbm_eval_tail_fraction", 0.3)),
         "time_param": list(getattr(args, "time_param", []) or []),
         "a_param": list(getattr(args, "a_param", []) or []),
         "c_param": list(getattr(args, "c_param", []) or []),
@@ -276,14 +277,14 @@ def load_args():
     parser.add_argument("--top_k_a", type=int, default=3)
     parser.add_argument("--top_k_b", type=int, default=3)
     parser.add_argument("--top_k_c", type=int, default=10)
-    parser.add_argument("--top_k_time", type=int, default=4)
-    parser.add_argument("--top_k_struct", type=int, default=8)
+    parser.add_argument("--top_k_time", type=int, default=3)
+    parser.add_argument("--top_k_struct", type=int, default=3)
     parser.add_argument("--all_trials", type=int, default=10)
 
     parser.add_argument("--component_metric", type=str, default="mrr")
     parser.add_argument("--struct_metric", type=str, default="hr10")
     parser.add_argument("--time_metric", type=str, default="mrr")
-    parser.add_argument("--hybrid_metric", type=str, default="hr10")
+    parser.add_argument("--hybrid_metric", type=str, default="mrr")
 
     parser.add_argument("--num_threads", type=int, default=8)
     parser.add_argument("--block_size", type=int, default=256)
@@ -293,8 +294,9 @@ def load_args():
     parser.add_argument("--top_hybrid_train", type=int, default=200)
     parser.add_argument("--hybrid_include_structure_features", action="store_true", default=False)
     parser.add_argument("--ignore_val_structure_combine", action="store_true", default=False)
-    parser.add_argument("--lgbm_n_trials", type=int, default=30)
+    parser.add_argument("--lgbm_n_trials", type=int, default=None)
     parser.add_argument("--lgbm_early_stopping_rounds", type=int, default=50)
+    parser.add_argument("--lgbm_eval_tail_fraction", type=float, default=0.3)
     parser.add_argument("--n_estimators", type=int, default=1000)
     parser.add_argument("--learning_rate", type=float, default=0.03)
     parser.add_argument("--num_leaves", type=int, default=63)
@@ -325,7 +327,10 @@ def load_args():
     parser.add_argument("--time_param", action="append", default=[])
     parser.add_argument("--a_param", action="append", default=[])
     parser.add_argument("--c_param", action="append", default=[])
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.lgbm_n_trials is None:
+        args.lgbm_n_trials = 10 if args.dataset == "ICEWS14" else 5
+    return args
 
 
 if __name__ == "__main__":
