@@ -8,7 +8,7 @@ from train_all import common_params, make_a_args, make_c_args, make_time_args, p
 from single_pipeline import a_single, c_single, time_single
 from single_pipeline.a_single import tune_a
 from single_pipeline.c_single import tune_c
-from single_pipeline.tuning import run_hybrid, run_struct, strict_val_score, tune_b, tune_time
+from single_pipeline.tuning import run_hybrid, run_hybrid_from_manifest, run_struct, strict_val_score, tune_b, tune_time
 from utils import load_metrics, ranking_metric_key
 
 
@@ -241,6 +241,24 @@ def run_stage(args):
         return summary
 
     if args.stage == "run_hybrid":
+        if args.hybrid_manifest and osp.isfile(args.hybrid_manifest):
+            manifest_payload = load_json(args.hybrid_manifest)
+            manifest_datasets = manifest_payload.get("datasets", manifest_payload)
+            if args.dataset in manifest_datasets:
+                summary = run_hybrid_from_manifest(
+                    args,
+                    args.hybrid_manifest,
+                    top_k_time=args.top_k_time,
+                    top_k_struct=args.top_k_struct,
+                    metric=args.hybrid_metric,
+                )
+                save_json(record_path(args, "hybrid_top.json"), summary)
+                return summary
+            print(
+                f"[distributed] {args.dataset} not in hybrid manifest {args.hybrid_manifest}; "
+                "falling back to records_dir",
+                flush=True,
+            )
         time_records = load_records(args, "time_top.json")
         struct_summary = load_record_payload(args, "struct_top.json")
         summary = run_hybrid(
@@ -273,6 +291,7 @@ def load_args():
     parser.add_argument("--train_predict_ratio", type=float, default=0.3)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--records_dir", type=str, default="tuning_records")
+    parser.add_argument("--hybrid_manifest", type=str, default="best_hyper_params/hybrid_component_paths.json")
 
     parser.add_argument("--top_k_a", type=int, default=3)
     parser.add_argument("--top_k_b", type=int, default=3)

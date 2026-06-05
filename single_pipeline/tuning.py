@@ -268,7 +268,137 @@ def evaluate_b_grid_params(raw, params, num_nodes):
 
 
 def candidate_key(*items):
-    return tuple(item.get("out_dir") or json.dumps(item.get("params", {}), sort_keys=True) for item in items)
+    key_parts = []
+    for item in items:
+        if item.get("out_dir"):
+            key_parts.append((item.get("out_dir"), item.get("combo_key"), item.get("model_path")))
+        else:
+            key_parts.append(json.dumps(item.get("params", {}), sort_keys=True))
+    return tuple(key_parts)
+
+
+def _manifest_dataset(manifest, dataset):
+    datasets = manifest.get("datasets", manifest)
+    if dataset not in datasets:
+        raise KeyError(f"{dataset} not found in hybrid manifest")
+    return datasets[dataset]
+
+
+def _manifest_time_records(base_args, items, metric):
+    records = []
+    metric_key = f"val_{ranking_metric_key(metric, strict=True)}"
+    for idx, item in enumerate(items, start=1):
+        out_dir = item["out_dir"]
+        score = item.get("score")
+        if score is None:
+            try:
+                score = hybrid_single.score_from_metrics(load_metrics(out_dir), metric)
+            except Exception:
+                score = 0.0
+        record = {
+            "rank_source": item.get("rank_source", "manifest"),
+            "score": float(score),
+            "metric": item.get("metric", metric_key),
+            "params": item.get("params", {}),
+            "out_dir": out_dir,
+            "manifest_index": idx,
+        }
+        if item.get("args"):
+            record["args"] = item["args"]
+        records.append(record)
+    records.sort(key=lambda record: record["score"], reverse=True)
+    return records
+
+
+def _manifest_struct_records(base_args, items, top_k, metric):
+    records = []
+    metric_key = ranking_metric_key(metric, strict=True)
+    for item in items:
+        out_dir = item["out_dir"]
+        combo_key = item.get("combo_key")
+        load_args = clone_args(
+            base_args,
+            struct_dir=out_dir,
+            struct_combo_key="" if combo_key is None else str(combo_key),
+            top_k_struct=max(int(top_k), 1),
+            struct_metric=metric,
+        )
+        try:
+            candidates = hybrid_single.load_struct_candidates_from_dir(out_dir, load_args)
+        except Exception as exc:
+            raise RuntimeError(f"cannot load structure candidates from manifest dir {out_dir}: {exc}") from exc
+        for cand in candidates:
+            record = cand["record"]
+            struct_record = {
+                "rank_source": item.get("rank_source", "manifest"),
+                "score": float(cand["score"]),
+                "metric": metric_key,
+                "out_dir": cand["dir"],
+                "combo_key": cand.get("combo_key"),
+                "model_path": cand.get("model_path"),
+                "a": {
+                    "out_dir": record.get("a_dir"),
+                    "config": record.get("a_config", {}),
+                },
+                "b": {
+                    "params": record.get("b_config", {}),
+                },
+                "c": {
+                    "out_dir": record.get("c_dir"),
+                    "config": record.get("c_config", {}),
+                },
+                "record": record,
+                "manifest_out_dir": out_dir,
+            }
+            if item.get("args"):
+                struct_record["args"] = item["args"]
+            records.append(struct_record)
+    seen = set()
+    unique = []
+    for record in sorted(records, key=lambda item: item["score"], reverse=True):
+        key = (record["out_dir"], record.get("combo_key"), record.get("model_path"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(record)
+    return unique[: int(top_k)]
+
+
+def run_hybrid_from_manifest(base_args, manifest_path, top_k_time=3, top_k_struct=3, metric="mrr"):
+    manifest = load_json(manifest_path)
+    dataset_cfg = _manifest_dataset(manifest, base_args.dataset)
+    time_records = _manifest_time_records(base_args, dataset_cfg.get("time", []), base_args.time_metric)
+    struct_records = _manifest_struct_records(
+        base_args,
+        dataset_cfg.get("structure", []),
+        top_k_struct,
+        base_args.struct_metric,
+    )
+    if not time_records:
+        raise ValueError(f"hybrid manifest has no time entries for {base_args.dataset}")
+    if not struct_records:
+        raise ValueError(f"hybrid manifest has no structure entries for {base_args.dataset}")
+    print(
+        f"[hybrid-manifest] dataset={base_args.dataset} "
+        f"time={len(time_records)} structure={len(struct_records)} path={manifest_path}",
+        flush=True,
+    )
+    for idx, record in enumerate(time_records[: int(top_k_time)], start=1):
+        print(f"[hybrid-manifest] T{idx} score={record['score']:.5f} dir={record['out_dir']}", flush=True)
+    for idx, record in enumerate(struct_records[: int(top_k_struct)], start=1):
+        print(
+            f"[hybrid-manifest] S{idx} score={record['score']:.5f} "
+            f"combo={record.get('combo_key')} dir={record['out_dir']}",
+            flush=True,
+        )
+    return run_hybrid(
+        base_args,
+        time_records,
+        {"top_by_validation": struct_records},
+        top_k_time=top_k_time,
+        top_k_struct=top_k_struct,
+        metric=metric,
+    )
 
 
 def ensure_a_test(candidate):

@@ -1,0 +1,88 @@
+{
+  "format": "hybrid_component_paths_v1",
+  "description": "Explicit component output paths for hybrid tuning. Structure dirs are expanded by summary.json/combo_cache at runtime.",
+  "datasets": {
+    "ICEWS14": {
+      "ns_q": 6000,
+      "ns_seed": 42,
+      "train_predict_ratio": 0.3,
+      "time": [
+        {
+          "out_dir": "results_time_tkg_single/ICEWS14/seed42/r9eb5b85515d8_topk30_mw5-15-30_ed96_hd192_bs4096_ebs384_neg6_samgroup_nsq6000_nss42_tpr0.3_abs1r0_gatechannel_rank1_lossmargin",
+          "score": 0.35968,
+          "metric": "val_mrr_strict",
+          "test_mrr_strict": 0.34213,
+          "test_hit@10_strict": 0.53687,
+          "source_log": "logs-time-0605/time_icews14_mrr_q6k_cfgA.log"
+        },
+        {
+          "out_dir": "results_time_tkg_single/ICEWS14/seed42/r210529791eed_topk40_mw5-15-30-60_ed96_hd192_bs4096_ebs384_neg8_samgroup_nsq6000_nss42_tpr0.3_abs1r0_gatechannel_rank1_lossmargin",
+          "score": 0.35920,
+          "metric": "val_mrr_strict",
+          "test_mrr_strict": 0.34106,
+          "test_hit@10_strict": 0.54054,
+          "source_log": "logs-time-0605/time_icews14_mrr_q6k_cfgB.log"
+        },
+        {
+          "out_dir": "results_time_tkg_single/ICEWS14/seed42/r041812cea350_topk70_mw5-15-30-60-120_ed96_hd192_bs4096_ebs384_neg4_samgroup_nsq6000_nss42_tpr0.3_abs1r0_gatechannel_rank1_lossmargin",
+          "score": 0.33655,
+          "metric": "val_mrr_strict",
+          "test_mrr_strict": 0.32153,
+          "test_hit@10_strict": 0.54330,
+          "source_log": "logs-time-0605/time_icews14_hr10_q6k_cfgB.log"
+        }
+      ],
+      "structure": [
+        {
+          "out_dir": "results_lgbm_single/ICEWS14/seed42/tr0.3_nq6000_ns42/m-mrr_cm-mrr/top1-1-1_traink1200_evalfull_iv0/b-6c8dbccf89/lgbm-2c179504/cfg-ff992ebb2dde",
+          "metric": "mrr_strict",
+          "source_log": "logs-structure-0605/struct_icews14_mrr_q6k_run_struct.log"
+        }
+      ]
+    },
+    "GDELT": {
+      "ns_q": 5000,
+      "ns_seed": 42,
+      "train_predict_ratio": 0.3,
+      "time": [
+        {
+          "out_dir": "results_time_tkg_single/GDELT/seed42/rec9ebf5506ad_topk60_mw7-30_ed64_hd128_bs2048_ebs192_neg4_samgroup_nsq5000_nss42_tpr0.3_abs1r0_gateoff_rank1_lossmargin",
+          "score": 0.24840,
+          "metric": "val_mrr_strict",
+          "test_mrr_strict": 0.23923,
+          "test_hit@10_strict": 0.39306,
+          "source_log": "logs-time-0605/time_gdelt_mrr_fast.log"
+        }
+      ],
+      "structure": [
+        {
+          "out_dir": "results_lgbm_single/GDELT/seed42/tr0.3_nq5000_ns42/m-mrr_cm-mrr/top1-1-1_traink1000_evalfull_iv0/b-6c8dbccf89/lgbm-3f6163e8/cfg-cb025bcf9910",
+          "metric": "mrr_strict",
+          "source_log": "logs-structure-0605/struct_gdelt_mrr_run_struct.log"
+        }
+      ]
+    },
+    "tkgl-polecat": {
+      "ns_q": 5000,
+      "ns_seed": 42,
+      "train_predict_ratio": 0.3,
+      "time": [
+        {
+          "out_dir": "results_time_tkg_single/tkgl-polecat/seed42/r59bae37154aa_topk80_mw30_ed64_hd128_bs2048_ebs128_neg2_samgroup_nsq5000_nss42_tpr0.3_abs1r0_gateoff_rank1_lossmargin",
+          "score": 0.31649,
+          "metric": "val_mrr_strict",
+          "test_mrr_strict": 0.32686,
+          "test_hit@10_strict": 0.52778,
+          "source_log": "logs-time-0605/time_polecat_fast_mrr.log"
+        }
+      ],
+      "structure": [
+        {
+          "out_dir": "results_lgbm_single/tkgl-polecat/seed42/tr0.3_nq5000_ns42/m-mrr_cm-mrr/top1-1-1_traink1200_evalfull_iv0/b-6c8dbccf89/lgbm-3f6163e8/cfg-878811439acf",
+          "metric": "mrr_strict",
+          "source_log": "logs-structure-0605/struct_polecat_run_struct.log"
+        }
+      ]
+    }
+  }
+}
