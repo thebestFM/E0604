@@ -71,7 +71,6 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--a_mode", choices=("energy", "rank"), required=True)
     parser.add_argument("--decay_a", type=float, required=True)
-    parser.add_argument("--ppr_beta", type=float, required=True)
     parser.add_argument("--a_score_topk", type=int, default=0)
     parser.add_argument("--close_update_backward", action="store_true", default=False)
     parser.add_argument("--no_eval_test", action="store_true", default=False)
