@@ -32,6 +32,11 @@ def save_json(path, payload):
         json.dump(payload, f, indent=2, sort_keys=True)
 
 
+def load_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def metric_token(metric):
     key = ranking_metric_key(metric, strict=True)
     if key == "mrr_strict":
