@@ -2976,13 +2976,52 @@ def run_inference(predictor, direct_scorer, data, args, semantic_updater, logic_
         }
         return finalize_metric_sums(metric_sums), split_stats
 
+    def update_only_split(snapshot_list, mode, is_train=False):
+        t0 = time.time()
+        total = len(snapshot_list)
+        event_count = 0
+        update_event_count = 0
+        for idx, (events, t_norm, t_orig) in enumerate(snapshot_list, start=1):
+            events_f64 = events_for_update(events, data, args, is_train=is_train)
+            update_runtime(
+                predictor,
+                direct_scorer,
+                events_f64,
+                t_norm,
+                semantic_updater,
+                logic_updater,
+            )
+            event_count += int(len(events))
+            update_event_count += int(len(events_f64))
+            elapsed = time.time() - t0
+            print(
+                f'[NewStructure] {mode} update-only snapshot {idx}/{total} '
+                f't_norm={int(t_norm)} t_orig={int(t_orig)} '
+                f'events={len(events)} update_events={len(events_f64)} '
+                f'elapsed={elapsed:.1f}s',
+                flush=True,
+            )
+        update_time = time.time() - t0
+        print(f'[NewStructure] {mode} update-only: {update_time:.1f}s', flush=True)
+        return {
+            'update_only': True,
+            'update_time_s': update_time,
+            'snapshot_count': int(total),
+            'event_count': int(event_count),
+            'update_event_count': int(update_event_count),
+        }
+
     train_metrics = None
     train_predict_stats = None
     if train_predict:
         print(f'[NewStructure] predict-then-train snapshots: {len(train_predict)}', flush=True)
         train_metrics, train_predict_stats = eval_split(train_predict, 'train', is_train=True)
 
-    val_metrics, val_stats = eval_split(data['val_list'], 'val')
+    val_metrics = None
+    if bool(getattr(args, 'skip_val_eval', False)):
+        val_stats = update_only_split(data['val_list'], 'val')
+    else:
+        val_metrics, val_stats = eval_split(data['val_list'], 'val')
     test_metrics = None
     test_stats = None
     if getattr(args, 'eval_test', True):
@@ -3019,6 +3058,8 @@ def make_new_result_dir(args):
         meb=args.max_events_in_single_batch,
         ts=args.top_share,
     )
+    if bool(getattr(args, 'skip_val_eval', False)):
+        common['skip_val_eval'] = 1
     if int(getattr(args, 'top_direct', -1)) >= 0:
         common['td'] = int(args.top_direct)
     if args.dataset in TGB_DATASETS:
@@ -3149,13 +3190,16 @@ def save_result(args, val_metrics, test_metrics=None, runtime_stats=None, train_
 
     metrics = {
         'format': 'new_structure_scores_v1',
-        'val_mrr': float(val_metrics['mrr_strict']),
+        'skip_val_eval': bool(getattr(args, 'skip_val_eval', False)),
     }
+    if val_metrics is not None:
+        metrics['val_mrr'] = float(val_metrics['mrr_strict'])
     if test_metrics is not None:
         metrics['test_mrr'] = float(test_metrics['mrr_strict'])
     if train_metrics is not None:
         metrics.update(prefix_metrics('train', train_metrics))
-    metrics.update(prefix_metrics('val', val_metrics))
+    if val_metrics is not None:
+        metrics.update(prefix_metrics('val', val_metrics))
     if test_metrics is not None:
         metrics.update(prefix_metrics('test', test_metrics))
     if runtime_stats is not None:
@@ -3278,18 +3322,23 @@ def main(args):
     data = load_structure_data(args)
     describe_loaded_data(data, prefix='[NewStructure]')
 
-    expected_modes = ('train', 'val') if data['train_predict_count'] else ('val',)
+    expected_modes = ('train',) if data['train_predict_count'] else ()
+    if not bool(getattr(args, 'skip_val_eval', False)):
+        expected_modes = expected_modes + ('val',)
     expected_modes = expected_modes + ('test',)
     if is_run_complete(out_dir, expected_modes):
         metrics = load_metrics(out_dir)
         has_required = (
             metrics.get('format') == 'new_structure_scores_v1'
-            and 'val_mrr_avg' in metrics
             and 'test_mrr_loose' in metrics
             and 'test_mrr_avg' in metrics
+            and bool(metrics.get('skip_val_eval', False)) == bool(getattr(args, 'skip_val_eval', False))
         )
+        if not bool(getattr(args, 'skip_val_eval', False)):
+            has_required = has_required and 'val_mrr_avg' in metrics
         if has_required:
-            metrics['val_mrr'] = metrics['val_mrr_strict']
+            if 'val_mrr_strict' in metrics:
+                metrics['val_mrr'] = metrics['val_mrr_strict']
             if 'test_mrr_strict' in metrics:
                 metrics['test_mrr'] = metrics['test_mrr_strict']
             print(f'[NewStructure] already complete: {out_dir}', flush=True)
@@ -3307,12 +3356,15 @@ def main(args):
     train_metrics, val_metrics, test_metrics, runtime_stats = run_inference(
         predictor, direct_scorer, data, args, semantic_updater, logic_updater
     )
-    msg = (
-        f"[NewStructure] gamma={args.gamma:g} direct_single_hop={args.direct_single_hop:g} "
-        f"val_mrr_loose={val_metrics['mrr_loose']:.5f} "
-        f"val_mrr_strict={val_metrics['mrr_strict']:.5f} "
-        f"val_mrr_avg={val_metrics['mrr_avg']:.5f}"
-    )
+    msg = f"[NewStructure] gamma={args.gamma:g} direct_single_hop={args.direct_single_hop:g}"
+    if val_metrics is not None:
+        msg += (
+            f" val_mrr_loose={val_metrics['mrr_loose']:.5f} "
+            f"val_mrr_strict={val_metrics['mrr_strict']:.5f} "
+            f"val_mrr_avg={val_metrics['mrr_avg']:.5f}"
+        )
+    else:
+        msg += " val_eval=skipped"
     if test_metrics is not None:
         msg += (
             f" test_mrr_loose={test_metrics['mrr_loose']:.5f} "
@@ -3357,6 +3409,7 @@ def parse_args():
     parser.add_argument('--decay_rel_trans', type=float, default=0.05)
     parser.add_argument('--window_semantic_sim', type=float, default=5.0)
     parser.add_argument('--window_trans', type=float, default=5.0)
+    parser.add_argument('--skip_val_eval', action='store_true', default=False)
     return parser.parse_args()
 
 
@@ -3364,7 +3417,7 @@ def cli():
     args = parse_args()
     metrics = main(args)
     out_dir = make_new_result_dir(args)
-    splits = ['val', 'test']
+    splits = ['test'] if bool(getattr(args, 'skip_val_eval', False)) else ['val', 'test']
     for split in splits:
         verify_split(out_dir, split, args.ns_q, args.dataset)
     print_strict_metrics(metrics, splits)
