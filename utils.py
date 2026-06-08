@@ -53,6 +53,82 @@ def set_random_seed(seed):
     print(f"INFO: fixed random seed: {seed}", flush=True)
 
 
+def cuda_device(device):
+    try:
+        import torch
+    except Exception:
+        return None
+    if not torch.cuda.is_available():
+        return None
+    dev = torch.device(device)
+    if dev.type != "cuda":
+        return None
+    if dev.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return dev
+
+
+def select_torch_device(gpu=0):
+    try:
+        import torch
+    except Exception:
+        return "cpu"
+    return f"cuda:{int(gpu)}" if torch.cuda.is_available() else "cpu"
+
+
+def cuda_synchronize(device):
+    try:
+        import torch
+    except Exception:
+        return
+    dev = cuda_device(device)
+    if dev is not None:
+        torch.cuda.synchronize(dev)
+
+
+def reset_cuda_peak(device):
+    try:
+        import torch
+    except Exception:
+        return False
+    dev = cuda_device(device)
+    if dev is None:
+        return False
+    torch.cuda.synchronize(dev)
+    torch.cuda.reset_peak_memory_stats(dev)
+    return True
+
+
+def cuda_peak_allocated(device):
+    try:
+        import torch
+    except Exception:
+        return None
+    dev = cuda_device(device)
+    if dev is None:
+        return None
+    torch.cuda.synchronize(dev)
+    return int(torch.cuda.max_memory_allocated(dev))
+
+
+def cuda_peak_reserved(device):
+    try:
+        import torch
+    except Exception:
+        return None
+    dev = cuda_device(device)
+    if dev is None:
+        return None
+    torch.cuda.synchronize(dev)
+    return int(torch.cuda.max_memory_reserved(dev))
+
+
+def format_bytes(num_bytes):
+    if num_bytes is None:
+        return "n/a"
+    return f"{num_bytes / (1024 ** 2):.1f}MB"
+
+
 def inverse_aug(events, num_rels_raw, num_rels):
     inverse = events.copy()
     inverse[:, 0] = events[:, 2]
