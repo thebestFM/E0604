@@ -321,6 +321,14 @@ def _manifest_struct_records(base_args, items, top_k, metric):
     for item in items:
         out_dir = item["out_dir"]
         combo_key = item.get("combo_key")
+        summary_path = osp.join(out_dir, "summary.json")
+        if not osp.isfile(summary_path):
+            raise RuntimeError(
+                f"structure-combine result is incomplete and cannot be used for hybrid: {out_dir}. "
+                f"Missing {summary_path}. The log may contain '[combine] output -> ...' without a final "
+                "'[combine] saved -> ...'; rerun run_struct/structure_combine until summary.json and "
+                "best_lgbm.txt are written."
+            )
         load_args = clone_args(
             base_args,
             struct_dir=out_dir,
