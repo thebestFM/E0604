@@ -26,6 +26,9 @@ DATASET_DEFAULTS = {
         "dsh_decay": 1.0,
         "combine_weights": [0.60, 0.75, 0.85, 0.90, 0.95],
         "shared_gammas": [0.001, 0.003, 0.01, 0.03, 0.10],
+        "top_dmh_for_shared": 3,
+        "top_dsh_for_combo": 3,
+        "top_c_for_combo": 3,
     },
     "GDELT": {
         "ns_q": 5000,
@@ -34,6 +37,9 @@ DATASET_DEFAULTS = {
         "dsh_decay": 0.1,
         "combine_weights": [0.60, 0.75, 0.85, 0.90, 0.95],
         "shared_gammas": [0.0003, 0.001, 0.003, 0.01, 0.03],
+        "top_dmh_for_shared": 3,
+        "top_dsh_for_combo": 3,
+        "top_c_for_combo": 3,
     },
     "tkgl-polecat": {
         "ns_q": 5000,
@@ -42,6 +48,20 @@ DATASET_DEFAULTS = {
         "dsh_decay": 0.01,
         "combine_weights": [0.02, 0.05, 0.10, 0.15, 0.25],
         "shared_gammas": [0.003, 0.006, 0.01, 0.02, 0.04],
+        "top_dmh_for_shared": 3,
+        "top_dsh_for_combo": 3,
+        "top_c_for_combo": 3,
+    },
+    "tkgl-icews": {
+        "ns_q": 5000,
+        "batch_size": 4096,
+        "max_events_in_single_batch": 60000,
+        "dsh_decay": 1.0,
+        "combine_weights": [0.60, 0.75, 0.88, 0.95],
+        "shared_gammas": [0.003, 0.006, 0.01, 0.02],
+        "top_dmh_for_shared": 2,
+        "top_dsh_for_combo": 3,
+        "top_c_for_combo": 2,
     },
 }
 
@@ -100,6 +120,8 @@ def dsh_grid(dataset):
         decays = [0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20, 0.30, 0.50, 0.80]
     elif dataset == "tkgl-polecat":
         decays = [0.001, 0.002, 0.005, 0.008, 0.010, 0.020, 0.050, 0.100, 0.200, 0.500]
+    elif dataset == "tkgl-icews":
+        decays = [0.50, 0.80, 1.00, 1.30, 1.80]
     else:
         raise ValueError(dataset)
     return [dict(common, decay_direct=d) for d in decays]
@@ -159,6 +181,15 @@ def dmh_grid(dataset):
             ("tag_max", 0.0200, 0.940),
         ]
         decay = 0.01
+    elif dataset == "tkgl-icews":
+        rows = [
+            ("tag_sum", 0.0125, 0.925),
+            ("tag_sum", 0.01579502319249557, 0.9343207039457382),
+            ("tag_sum", 0.0180, 0.940),
+            ("tag_sum", 0.0220, 0.948),
+            ("tag_max", 0.01579502319249557, 0.9343207039457382),
+        ]
+        decay = 1.0
     else:
         raise ValueError(dataset)
     return [dict(base, dict_mode=m, ppr_alpha=a, ppr_beta=b, decay_direct=decay) for m, a, b in rows]
@@ -282,7 +313,7 @@ def main(args):
         print("[TuneStructure] " + record_line(rec, focus), flush=True)
         save_summary(out_dir, summary)
 
-    top_dmh = sort_top(summary["dmh"], focus, 3)
+    top_dmh = sort_top(summary["dmh"], focus, DATASET_DEFAULTS[args.dataset]["top_dmh_for_shared"])
     print("[TuneStructure] top pure DMH:", flush=True)
     for rec in top_dmh:
         print("[TuneStructure]   " + record_line(rec, focus), flush=True)
@@ -300,9 +331,9 @@ def main(args):
             save_summary(out_dir, summary)
             idx += 1
 
-    top_dsh = sort_top(summary["dsh"], focus, 3)
+    top_dsh = sort_top(summary["dsh"], focus, DATASET_DEFAULTS[args.dataset]["top_dsh_for_combo"])
     c_pool = summary["dmh"] + summary["dmh_shared"]
-    top_c = sort_top(c_pool, focus, 3)
+    top_c = sort_top(c_pool, focus, DATASET_DEFAULTS[args.dataset]["top_c_for_combo"])
     print("[TuneStructure] top pure DSH:", flush=True)
     for rec in top_dsh:
         print("[TuneStructure]   " + record_line(rec, focus), flush=True)
