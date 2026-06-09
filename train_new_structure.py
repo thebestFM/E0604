@@ -39,6 +39,9 @@ from utils import (
 )
 
 
+NEW_STRUCTURE_IMPL = 'new_structure_v2'
+
+
 class LogicMatrixUpdater:
     """Logic Matrix Updater for M_trans"""
     def __init__(self, num_nodes, num_rels, window_size=10.0, decay_factor=0.1, device='cuda:0'):
@@ -2909,6 +2912,14 @@ def run_inference(predictor, direct_scorer, data, args, semantic_updater, logic_
                     direct_scorer,
                     args.direct_single_hop,
                 )
+                pos_nonfinite = int(np.size(pos) - np.sum(np.isfinite(pos)))
+                neg_nonfinite = int(np.size(neg[neg_mask]) - np.sum(np.isfinite(neg[neg_mask])))
+                if pos_nonfinite or neg_nonfinite:
+                    raise RuntimeError(
+                        f'[NewStructure] non-finite scores in {mode} at snapshot {idx}/{total} '
+                        f't_norm={int(t_norm)} t_orig={int(t_orig)} '
+                        f'pos_nonfinite={pos_nonfinite} neg_nonfinite={neg_nonfinite}'
+                    )
                 cuda_synchronize(predictor.device)
                 inference_time += time.perf_counter() - pred_t0
                 inference_pos_count += int(len(batch_data))
@@ -3046,7 +3057,7 @@ def run_inference(predictor, direct_scorer, data, args, semantic_updater, logic_
 
 def make_new_result_dir(args):
     common = dict(
-        impl='new_structure_v2',
+        impl=NEW_STRUCTURE_IMPL,
         dict_mode=args.dict_mode,
         shared_w=args.shared_w,
         ppr_k=args.ppr_k,

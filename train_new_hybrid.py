@@ -2,6 +2,7 @@ import argparse
 import copy
 import gc
 import hashlib
+import inspect
 import json
 import os
 import os.path as osp
@@ -27,6 +28,7 @@ from utils import (
 
 EPS = 1e-12
 FIT_PROTOCOL = "new_hybrid_fixed_anchor_v2"
+EXPECTED_STRUCTURE_IMPL = "new_structure_v2"
 
 
 LGBM_FIXED_PARAM_SETS = [
@@ -1012,6 +1014,40 @@ def require_score_dir(out_dir, label):
         raise FileNotFoundError(f"{label} score files are incomplete under {out_dir}:\n  {text}{extra}")
 
 
+def require_train_new_structure_v2():
+    impl = getattr(train_new_structure, "NEW_STRUCTURE_IMPL", None)
+    if impl is not None:
+        if impl != EXPECTED_STRUCTURE_IMPL:
+            raise RuntimeError(
+                "train_new_hybrid.py requires train_new_structure.NEW_STRUCTURE_IMPL "
+                f"to be {EXPECTED_STRUCTURE_IMPL!r}, got {impl!r}"
+            )
+        return
+
+    try:
+        source = inspect.getsource(train_new_structure.make_new_result_dir)
+    except (OSError, TypeError) as exc:
+        raise RuntimeError("cannot inspect train_new_structure.make_new_result_dir") from exc
+    if EXPECTED_STRUCTURE_IMPL not in source:
+        raise RuntimeError(
+            "train_new_hybrid.py requires train_new_structure.make_new_result_dir "
+            f"to use impl={EXPECTED_STRUCTURE_IMPL!r}"
+        )
+
+
+def assert_score_store_finite(out_dir, label, splits=("train", "val", "test")):
+    for split in splits:
+        store = ScoreStore(out_dir, split)
+        pos_nonfinite = int(np.size(store.pos) - np.sum(np.isfinite(store.pos)))
+        neg_data = store.neg.data
+        neg_nonfinite = int(np.size(neg_data) - np.sum(np.isfinite(neg_data)))
+        if pos_nonfinite or neg_nonfinite:
+            raise RuntimeError(
+                f"{label} {split} has non-finite raw scores: "
+                f"pos_nonfinite={pos_nonfinite} neg_nonfinite={neg_nonfinite} dir={out_dir}"
+            )
+
+
 def inspect_score_store_against_data(out_dir, label, data, args, sample_queries=None):
     expected_negs = int(args.ns_q)
     if expected_negs <= 0:
@@ -1137,20 +1173,17 @@ def make_structure_args(args, cfg):
 
 
 def prepare_structure_runs(args):
+    require_train_new_structure_v2()
     runs = []
     for cfg in STRUCTURE_CONFIGS[args.dataset]:
         sargs = make_structure_args(args, cfg)
         out_dir = train_new_structure.make_new_result_dir(sargs)
-        if "impl=new_structure_v2" not in out_dir.replace("\\", "/"):
-            raise RuntimeError(
-                "train_new_hybrid.py must use train_new_structure.py with impl=new_structure_v2; "
-                f"got output dir: {out_dir}"
-            )
         print(f"[NewHybrid] structure {cfg['id']} -> {out_dir}", flush=True)
         if not complete_score_dir(out_dir):
             print(f"[NewHybrid] running full structure inference for {cfg['id']}", flush=True)
             train_new_structure.main(sargs)
         require_score_dir(out_dir, f"structure {cfg['id']}")
+        assert_score_store_finite(out_dir, f"structure {cfg['id']}")
         run = copy.deepcopy(cfg)
         run["dir"] = out_dir
         run["args"] = vars(sargs)
@@ -1169,6 +1202,7 @@ def prepare_time_runs(args, data):
                 rel = "/".join(parts[1:])
             run["dir"] = osp.join(args.time_root, rel)
         require_score_dir(run["dir"], f"time {run['id']}")
+        assert_score_store_finite(run["dir"], f"time {run['id']}")
         inspect_score_store_against_data(run["dir"], f"time {run['id']}", data, args)
         run["test_metrics_computed"] = print_score_store_baseline(
             run["dir"],
@@ -1185,6 +1219,7 @@ def prepare_time_runs(args, data):
 def verify_structure_runs(struct_runs, data, args):
     for run in struct_runs:
         require_score_dir(run["dir"], f"structure {run['id']}")
+        assert_score_store_finite(run["dir"], f"structure {run['id']}")
         inspect_score_store_against_data(run["dir"], f"structure {run['id']}", data, args)
         run["test_metrics_computed"] = print_score_store_baseline(
             run["dir"],
