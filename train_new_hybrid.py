@@ -26,7 +26,141 @@ from utils import (
 
 
 EPS = 1e-12
-FIT_PROTOCOL = "new_hybrid_lgbm_test_hr10_v1"
+FIT_PROTOCOL = "new_hybrid_fixed_anchor_v2"
+
+
+LGBM_FIXED_PARAM_SETS = [
+    {
+        "name": "old_hybrid_tree1",
+        "n_estimators": 1,
+        "learning_rate": 0.03753885387101247,
+        "num_leaves": 21,
+        "max_depth": 12,
+        "min_child_samples": 39,
+        "reg_lambda": 0.6376811127061687,
+        "reg_alpha": 0.0013242769886098894,
+        "min_split_gain": 0.00023728487317629075,
+        "subsample": 0.990325975281362,
+        "colsample_bytree": 0.7627169011118449,
+    },
+    {
+        "name": "old_hybrid_tree2",
+        "n_estimators": 2,
+        "learning_rate": 0.03753885387101247,
+        "num_leaves": 21,
+        "max_depth": 12,
+        "min_child_samples": 39,
+        "reg_lambda": 0.6376811127061687,
+        "reg_alpha": 0.0013242769886098894,
+        "min_split_gain": 0.00023728487317629075,
+        "subsample": 0.990325975281362,
+        "colsample_bytree": 0.7627169011118449,
+    },
+    {
+        "name": "old_hybrid_tree4",
+        "n_estimators": 4,
+        "learning_rate": 0.03753885387101247,
+        "num_leaves": 21,
+        "max_depth": 12,
+        "min_child_samples": 39,
+        "reg_lambda": 0.6376811127061687,
+        "reg_alpha": 0.0013242769886098894,
+        "min_split_gain": 0.00023728487317629075,
+        "subsample": 0.990325975281362,
+        "colsample_bytree": 0.7627169011118449,
+    },
+    {
+        "name": "old_hybrid_tree8",
+        "n_estimators": 8,
+        "learning_rate": 0.03753885387101247,
+        "num_leaves": 21,
+        "max_depth": 12,
+        "min_child_samples": 39,
+        "reg_lambda": 0.6376811127061687,
+        "reg_alpha": 0.0013242769886098894,
+        "min_split_gain": 0.00023728487317629075,
+        "subsample": 0.990325975281362,
+        "colsample_bytree": 0.7627169011118449,
+    },
+    {
+        "name": "old_structure_tree8",
+        "n_estimators": 8,
+        "learning_rate": 0.015116739956471236,
+        "num_leaves": 15,
+        "max_depth": 11,
+        "min_child_samples": 147,
+        "reg_lambda": 0.8241925264876453,
+        "reg_alpha": 0.28383821193536135,
+        "min_split_gain": 0.007404465173409036,
+        "subsample": 0.8075397185632818,
+        "colsample_bytree": 0.7347607178575388,
+    },
+    {
+        "name": "tiny_leaves7_tree4",
+        "n_estimators": 4,
+        "learning_rate": 0.04,
+        "num_leaves": 7,
+        "max_depth": 3,
+        "min_child_samples": 50,
+        "reg_lambda": 0.5,
+        "reg_alpha": 0.001,
+        "min_split_gain": 0.0,
+        "subsample": 1.0,
+        "colsample_bytree": 0.8,
+    },
+    {
+        "name": "small_leaves15_tree8",
+        "n_estimators": 8,
+        "learning_rate": 0.03,
+        "num_leaves": 15,
+        "max_depth": 7,
+        "min_child_samples": 75,
+        "reg_lambda": 0.8,
+        "reg_alpha": 0.01,
+        "min_split_gain": 0.001,
+        "subsample": 0.95,
+        "colsample_bytree": 0.85,
+    },
+    {
+        "name": "small_leaves31_tree16",
+        "n_estimators": 16,
+        "learning_rate": 0.025,
+        "num_leaves": 31,
+        "max_depth": 9,
+        "min_child_samples": 100,
+        "reg_lambda": 1.0,
+        "reg_alpha": 0.05,
+        "min_split_gain": 0.002,
+        "subsample": 0.9,
+        "colsample_bytree": 0.85,
+    },
+    {
+        "name": "low_reg_tree16",
+        "n_estimators": 16,
+        "learning_rate": 0.02,
+        "num_leaves": 21,
+        "max_depth": 12,
+        "min_child_samples": 25,
+        "reg_lambda": 0.2,
+        "reg_alpha": 0.0001,
+        "min_split_gain": 0.0,
+        "subsample": 1.0,
+        "colsample_bytree": 0.9,
+    },
+    {
+        "name": "conservative_tree32",
+        "n_estimators": 32,
+        "learning_rate": 0.015,
+        "num_leaves": 15,
+        "max_depth": 9,
+        "min_child_samples": 150,
+        "reg_lambda": 2.0,
+        "reg_alpha": 0.1,
+        "min_split_gain": 0.003,
+        "subsample": 0.9,
+        "colsample_bytree": 0.8,
+    },
+]
 
 
 STRUCTURE_CONFIGS = {
@@ -353,6 +487,86 @@ def metric_value(metrics, metric):
     return float(metrics[ranking_metric_key(metric, strict=True)])
 
 
+def format_metric_line(metrics):
+    return (
+        f"mrr={metrics['mrr_strict']:.5f} "
+        f"hr1={metrics['hit@1_strict']:.5f} "
+        f"hr10={metrics['hit@10_strict']:.5f}"
+    )
+
+
+def evaluate_score_store(out_dir, label, data, args, split="test"):
+    store = ScoreStore(out_dir, split)
+    expected_width = int(args.ns_q)
+    sums = {}
+    row_offset = 0
+    nonfinite = 0
+    for events, _, t_orig in split_snapshots(data, split):
+        for batch_data, neg_arr, _ in collect_eval_batch(
+            events,
+            t_orig,
+            data["negative_sampler"],
+            split,
+            int(args.query_batch_size),
+        ):
+            batch_size = int(len(batch_data))
+            width = int(neg_arr.shape[1])
+            if width != expected_width:
+                raise RuntimeError(
+                    f"{label} {split} negative width mismatch at row {row_offset}: "
+                    f"got={width} expected={expected_width}"
+                )
+            pos, neg, neg_mask = store.get_block(row_offset, row_offset + batch_size, width)
+            valid = np.concatenate(
+                (
+                    np.ones((batch_size, 1), dtype=bool),
+                    neg_mask,
+                ),
+                axis=1,
+            )
+            raw_scores = np.concatenate((pos, neg), axis=1).astype(np.float32, copy=False)
+            nonfinite += int(np.size(raw_scores[valid]) - np.sum(np.isfinite(raw_scores[valid])))
+            scores = sanitize_score_matrix(raw_scores, valid)
+
+            loose = []
+            strict = []
+            avg = []
+            for row in range(batch_size):
+                row_valid = valid[row]
+                row_scores = scores[row, row_valid]
+                pos_score = row_scores[0]
+                neg_scores = row_scores[1:]
+                l_rank = 1 + int(np.sum(neg_scores > pos_score))
+                s_rank = 1 + int(np.sum(neg_scores >= pos_score))
+                loose.append(l_rank)
+                strict.append(s_rank)
+                avg.append((l_rank + s_rank) * 0.5)
+            add_rank_sums(
+                sums,
+                np.asarray(loose, dtype=np.int64),
+                np.asarray(strict, dtype=np.int64),
+                np.asarray(avg, dtype=np.float64),
+            )
+            row_offset += batch_size
+
+    if row_offset != store.num_rows:
+        raise RuntimeError(f"{label} {split} row count mismatch: streamed={row_offset} store={store.num_rows}")
+    metrics = finalize_metric_sums(sums)
+    metrics["num_queries"] = int(sums.get("count", 0))
+    metrics["nonfinite_scores"] = int(nonfinite)
+    return metrics
+
+
+def print_score_store_baseline(out_dir, label, data, args, split="test"):
+    metrics = evaluate_score_store(out_dir, label, data, args, split=split)
+    print(
+        f"[NewHybrid][baseline] {label} {split}: {format_metric_line(metrics)} "
+        f"queries={metrics['num_queries']} nonfinite_scores={metrics['nonfinite_scores']}",
+        flush=True,
+    )
+    return metrics
+
+
 class NewHybridFeatureBuilder:
     def __init__(self, num_rels):
         self.num_rels = int(num_rels)
@@ -634,21 +848,6 @@ def evaluate_hybrid(context, model, split, args):
     return metrics
 
 
-def sample_lgbm_params(trial):
-    return {
-        "n_estimators": trial.suggest_int("n_estimators", 400, 2200, step=200),
-        "learning_rate": trial.suggest_float("learning_rate", 0.015, 0.08, log=True),
-        "num_leaves": trial.suggest_categorical("num_leaves", [31, 63, 127, 255]),
-        "max_depth": trial.suggest_categorical("max_depth", [-1, 5, 7, 9, 11]),
-        "min_child_samples": trial.suggest_int("min_child_samples", 50, 500, step=25),
-        "reg_lambda": trial.suggest_float("reg_lambda", 0.1, 30.0, log=True),
-        "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 3.0, log=True),
-        "min_split_gain": trial.suggest_float("min_split_gain", 0.0, 0.05),
-        "subsample": trial.suggest_float("subsample", 0.75, 1.0),
-        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.75, 1.0),
-    }
-
-
 def fit_lgbm_ranker(X, y, group, feature_names, args, params, eval_data=None):
     try:
         import lightgbm as lgb
@@ -731,8 +930,8 @@ def pair_key(args, struct_run, time_run):
             "top_hybrid_train": args.top_hybrid_train,
             "lgbm_eval_topk": args.lgbm_eval_topk,
             "lgbm_eval_tail_fraction": args.lgbm_eval_tail_fraction,
-            "lgbm_n_trials": args.lgbm_n_trials,
-            "lgbm_early_stopping_rounds": args.lgbm_early_stopping_rounds,
+            "lgbm_fixed_param_names": [x["name"] for x in LGBM_FIXED_PARAM_SETS],
+            "lgbm_use_early_stop": False,
             "metric": args.metric,
             "struct_id": struct_run["id"],
             "struct_dir": struct_run["dir"],
@@ -755,7 +954,7 @@ def make_out_dir(args):
             "top_hybrid_train": args.top_hybrid_train,
             "lgbm_eval_topk": args.lgbm_eval_topk,
             "lgbm_eval_tail_fraction": args.lgbm_eval_tail_fraction,
-            "lgbm_n_trials": args.lgbm_n_trials,
+            "lgbm_fixed_param_names": [x["name"] for x in LGBM_FIXED_PARAM_SETS],
             "metric": args.metric,
         },
         length=12,
@@ -774,7 +973,7 @@ def load_pair_cache(out_dir, key):
         return None
     with open(path, "r", encoding="utf-8") as f:
         payload = json.load(f)
-    if payload.get("format") != "new_hybrid_pair_v1" or payload.get("pair_key") != key:
+    if payload.get("format") != "new_hybrid_pair_v2" or payload.get("pair_key") != key:
         return None
     return payload["record"], model_path
 
@@ -786,7 +985,7 @@ def save_pair_cache(out_dir, key, record, model):
     with open(osp.join(cdir, "record.json"), "w", encoding="utf-8") as f:
         json.dump(
             {
-                "format": "new_hybrid_pair_v1",
+                "format": "new_hybrid_pair_v2",
                 "pair_key": key,
                 "record": record,
                 "model_path": model_path,
@@ -942,6 +1141,11 @@ def prepare_structure_runs(args):
     for cfg in STRUCTURE_CONFIGS[args.dataset]:
         sargs = make_structure_args(args, cfg)
         out_dir = train_new_structure.make_new_result_dir(sargs)
+        if "impl=new_structure_v2" not in out_dir.replace("\\", "/"):
+            raise RuntimeError(
+                "train_new_hybrid.py must use train_new_structure.py with impl=new_structure_v2; "
+                f"got output dir: {out_dir}"
+            )
         print(f"[NewHybrid] structure {cfg['id']} -> {out_dir}", flush=True)
         if not complete_score_dir(out_dir):
             print(f"[NewHybrid] running full structure inference for {cfg['id']}", flush=True)
@@ -966,6 +1170,13 @@ def prepare_time_runs(args, data):
             run["dir"] = osp.join(args.time_root, rel)
         require_score_dir(run["dir"], f"time {run['id']}")
         inspect_score_store_against_data(run["dir"], f"time {run['id']}", data, args)
+        run["test_metrics_computed"] = print_score_store_baseline(
+            run["dir"],
+            f"time {run['id']}",
+            data,
+            args,
+            split="test",
+        )
         runs.append(run)
         print(f"[NewHybrid] time {run['id']} -> {run['dir']}", flush=True)
     return runs
@@ -975,6 +1186,13 @@ def verify_structure_runs(struct_runs, data, args):
     for run in struct_runs:
         require_score_dir(run["dir"], f"structure {run['id']}")
         inspect_score_store_against_data(run["dir"], f"structure {run['id']}", data, args)
+        run["test_metrics_computed"] = print_score_store_baseline(
+            run["dir"],
+            f"structure {run['id']}",
+            data,
+            args,
+            split="test",
+        )
 
 
 def make_context(args, data, struct_run, time_run):
@@ -989,11 +1207,6 @@ def make_context(args, data, struct_run, time_run):
 
 
 def tune_pair(context, args):
-    try:
-        import optuna
-    except Exception as exc:
-        raise RuntimeError("train_new_hybrid.py requires optuna for 20-trial tuning") from exc
-
     print("[NewHybrid] building train matrix", flush=True)
     X_train, y_train, group_train, train_info = build_train_matrix(context, args)
     matrix_diagnostics("train", X_train, y_train, group_train)
@@ -1002,28 +1215,20 @@ def tune_pair(context, args):
         f"features={X_train.shape[1]} topk={train_info['topk']}",
         flush=True,
     )
-    print("[NewHybrid] building val-tail eval_set", flush=True)
-    eval_data, eval_info = build_lgbm_eval_matrix(context, args)
-    matrix_diagnostics("val_eval", eval_data[0], eval_data[1], eval_data[2])
-    print(
-        f"[NewHybrid] eval matrix queries={eval_info['queries']} rows={eval_info['rows']} "
-        f"topk={eval_info['topk']} tail_fraction={eval_info['tail_fraction']}",
-        flush=True,
-    )
 
     best = {
         "score": -float("inf"),
         "model": None,
         "params": None,
+        "param_name": None,
         "test_metrics": None,
         "best_iteration": None,
         "trial": None,
     }
-    sampler = optuna.samplers.TPESampler(seed=int(args.seed))
-    study = optuna.create_study(direction="maximize", sampler=sampler)
+    anchor_records = []
 
-    def objective(trial):
-        params = sample_lgbm_params(trial)
+    for trial_idx, raw_params in enumerate(LGBM_FIXED_PARAM_SETS):
+        params = {k: v for k, v in raw_params.items() if k != "name"}
         model = fit_lgbm_ranker(
             X_train,
             y_train,
@@ -1031,21 +1236,30 @@ def tune_pair(context, args):
             context.feature_builder.feature_names,
             args,
             params,
-            eval_data=eval_data,
+            eval_data=None,
         )
         test_metrics = evaluate_hybrid(context, model, "test", args)
         score = metric_value(test_metrics, args.metric)
         best_iteration = int(getattr(model, "best_iteration_", 0) or params["n_estimators"])
         print(
-            f"[NewHybrid][trial {trial.number}] "
+            f"[NewHybrid][fixed {trial_idx}:{raw_params['name']}] "
             f"test_mrr={test_metrics['mrr_strict']:.5f} "
+            f"test_hr1={test_metrics['hit@1_strict']:.5f} "
             f"test_hr10={test_metrics['hit@10_strict']:.5f} "
             f"objective_{args.metric}={score:.5f} "
-            f"best_iteration={best_iteration} params={params}",
+            f"n_estimators={params['n_estimators']} params={params}",
             flush=True,
         )
-        trial.set_user_attr("test_metrics", test_metrics)
-        trial.set_user_attr("best_iteration", best_iteration)
+        anchor_records.append(
+            {
+                "trial": int(trial_idx),
+                "name": raw_params["name"],
+                "params": dict(params),
+                "best_iteration": int(best_iteration),
+                "selection_score": float(score),
+                "test_metrics": test_metrics,
+            }
+        )
         if score > best["score"]:
             if best["model"] is not None:
                 del best["model"]
@@ -1055,22 +1269,18 @@ def tune_pair(context, args):
                     "score": float(score),
                     "model": model,
                     "params": dict(params),
+                    "param_name": raw_params["name"],
                     "test_metrics": test_metrics,
                     "best_iteration": int(best_iteration),
-                    "trial": int(trial.number),
+                    "trial": int(trial_idx),
                 }
             )
         else:
             del model
             gc.collect()
-        return score
-
-    study.optimize(objective, n_trials=int(args.lgbm_n_trials))
     if best["model"] is None:
-        raise RuntimeError("LGBM tuning produced no model")
+        raise RuntimeError("fixed LGBM anchor evaluation produced no model")
 
-    val_metrics = evaluate_hybrid(context, best["model"], "val", args)
-    train_metrics = evaluate_hybrid(context, best["model"], "train", args)
     return best["model"], {
         "format": "new_hybrid_pair_result_v1",
         "fit_protocol": FIT_PROTOCOL,
@@ -1086,14 +1296,18 @@ def tune_pair(context, args):
         "selection_metric": args.metric,
         "selection_score": float(best["score"]),
         "best_trial": int(best["trial"]),
+        "best_param_name": best["param_name"],
         "best_iteration": int(best["best_iteration"]),
         "best_params": best["params"],
+        "fixed_param_sets": LGBM_FIXED_PARAM_SETS,
+        "anchor_records": anchor_records,
         "train_info": train_info,
-        "eval_info": eval_info,
-        "train_metrics": train_metrics,
-        "val_metrics": val_metrics,
+        "eval_info": None,
+        "train_metrics": None,
+        "val_metrics": None,
         "test_metrics": best["test_metrics"],
         "objective_split": "test",
+        "uses_early_stopping": False,
     }
 
 
@@ -1130,14 +1344,12 @@ def validate_args(args):
         raise ValueError(f"--dataset must be one of {sorted(STRUCTURE_CONFIGS)}")
     args.ns_q = int(DATASET_COMMON[args.dataset]["ns_q"])
     normalize_gpu_arg(args)
-    if int(args.lgbm_n_trials) <= 0:
-        raise ValueError("--lgbm_n_trials must be positive; this script is intended for 20-trial tuning")
     if int(args.query_batch_size) <= 0:
         raise ValueError("--query_batch_size must be > 0")
     if int(args.score_check_queries) <= 0:
         raise ValueError("--score_check_queries must be > 0")
-    if int(args.top_hybrid_train) == 0 or int(args.lgbm_eval_topk) == 0:
-        raise ValueError("--top_hybrid_train/--lgbm_eval_topk must be -1 or positive")
+    if int(args.top_hybrid_train) == 0:
+        raise ValueError("--top_hybrid_train must be -1 or positive")
     if args.metric.lower().replace("@", "") not in ("hr10", "hit10", "mrr"):
         raise ValueError("--metric supports hr10/hit10 or mrr")
 
@@ -1187,9 +1399,14 @@ def run(args):
             cached = load_pair_cache(out_dir, key)
             if cached is not None and not args.force:
                 record, model_path = cached
+                metrics = record["test_metrics"]
                 print(
                     f"[NewHybrid] cached pair struct={struct_run['id']} time={time_run['id']} "
-                    f"score={record['selection_score']:.5f}",
+                    f"test_mrr={metrics['mrr_strict']:.5f} "
+                    f"test_hr1={metrics['hit@1_strict']:.5f} "
+                    f"test_hr10={metrics['hit@10_strict']:.5f} "
+                    f"score={record['selection_score']:.5f} "
+                    f"param={record.get('best_param_name')}",
                     flush=True,
                 )
             else:
@@ -1230,8 +1447,10 @@ def run(args):
     print(
         f"[NewHybrid] best struct={best_record['struct_id']} time={best_record['time_id']} "
         f"test_mrr={best_record['test_metrics']['mrr_strict']:.5f} "
+        f"test_hr1={best_record['test_metrics']['hit@1_strict']:.5f} "
         f"test_hr10={best_record['test_metrics']['hit@10_strict']:.5f} "
-        f"trial={best_record['best_trial']} model={best_model_path}",
+        f"trial={best_record['best_trial']} param={best_record.get('best_param_name')} "
+        f"model={best_model_path}",
         flush=True,
     )
     return summary
@@ -1250,11 +1469,11 @@ def parse_args():
     parser.add_argument("--output_root", default="results_new_hybrid")
     parser.add_argument("--query_batch_size", type=int, default=2048)
     parser.add_argument("--score_check_queries", type=int, default=1)
-    parser.add_argument("--top_hybrid_train", type=int, default=200)
+    parser.add_argument("--top_hybrid_train", type=int, default=100)
     parser.add_argument("--lgbm_eval_topk", type=int, default=200)
     parser.add_argument("--lgbm_eval_tail_fraction", type=float, default=0.3)
-    parser.add_argument("--lgbm_n_trials", type=int, default=20)
-    parser.add_argument("--lgbm_early_stopping_rounds", type=int, default=50)
+    parser.add_argument("--lgbm_n_trials", type=int, default=20, help="Ignored in fixed-anchor mode.")
+    parser.add_argument("--lgbm_early_stopping_rounds", type=int, default=50, help="Ignored in fixed-anchor mode.")
     parser.add_argument("--num_threads", type=int, default=32)
     parser.add_argument("--metric", default="hr10")
     parser.add_argument("--force", action="store_true", default=False)
