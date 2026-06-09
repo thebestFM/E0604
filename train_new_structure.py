@@ -226,7 +226,9 @@ def _top_direct_masks(pos_direct, neg_direct, neg_samples, top_direct):
         pos_mask[:, 0] = True
         neg_mask[:, :] = neg_samples >= 0
         return pos_mask, neg_mask
-    if top_direct == 0 or batch_size == 0:
+    if top_direct == 0:
+        raise ValueError('top_direct must be -1 or a positive integer')
+    if batch_size == 0:
         return pos_mask, neg_mask
 
     valid = np.concatenate(
@@ -300,8 +302,36 @@ class DirectSingleHopScorer:
         self._sr_version = {}
         self._array_cache = {}
 
+    def _warn(self, where, message):
+        print(f'[DSH-warning] {where}: {message}', flush=True)
+
     def _sr_key(self, s, r):
         return int(s) * self.rel_shift + int(r)
+
+    def _clear_sr(self, sr, where='', reason=''):
+        if where or reason:
+            size = len(self.V_sr.get(sr, {}))
+            total = self.V_sr_sum.get(sr, None)
+            self._warn(
+                where or 'clear_sr',
+                f'clearing (source,relation) bucket sr={sr}; reason={reason or "invalid state"}; '
+                f'entries={size}; total={total}',
+            )
+        self.V_sr.pop(sr, None)
+        self.V_sr_sum.pop(sr, None)
+        self._mark_dirty(sr)
+
+    def _clear_all(self, where='', reason=''):
+        if where or reason:
+            self._warn(
+                where or 'clear_all',
+                f'clearing all DSH state; reason={reason or "invalid state"}; '
+                f'buckets={len(self.V_sr)}',
+            )
+        self.V_sr.clear()
+        self.V_sr_sum.clear()
+        self._array_cache.clear()
+        self._sr_version.clear()
 
     def _mark_dirty(self, sr):
         self._sr_version[sr] = self._sr_version.get(sr, 0) + 1
@@ -319,11 +349,23 @@ class DirectSingleHopScorer:
             values = np.empty(0, dtype=np.float32)
         else:
             total = float(self.V_sr_sum.get(sr, 0.0))
-            keys = np.fromiter(bucket.keys(), dtype=np.int64, count=len(bucket))
-            if total > 0.0 and math.isfinite(total):
-                values = np.fromiter((float(v) / total for v in bucket.values()), dtype=np.float32, count=len(bucket))
+            if total <= 0.0 or not math.isfinite(total):
+                self._clear_sr(sr, where='_bucket_arrays', reason=f'non-finite or non-positive total={total}')
+                keys = np.empty(0, dtype=np.int64)
+                values = np.empty(0, dtype=np.float32)
             else:
-                values = np.zeros(len(bucket), dtype=np.float32)
+                keys = np.fromiter(bucket.keys(), dtype=np.int64, count=len(bucket))
+                raw_values = np.fromiter((float(v) for v in bucket.values()), dtype=np.float64, count=len(bucket))
+                if np.any(raw_values < 0.0) or not np.all(np.isfinite(raw_values)):
+                    self._clear_sr(sr, where='_bucket_arrays', reason='bucket contains negative or non-finite values')
+                    keys = np.empty(0, dtype=np.int64)
+                    values = np.empty(0, dtype=np.float32)
+                else:
+                    values = (raw_values / total).astype(np.float32, copy=False)
+                    if not np.all(np.isfinite(values)):
+                        self._clear_sr(sr, where='_bucket_arrays', reason=f'normalization produced non-finite values; total={total}')
+                        keys = np.empty(0, dtype=np.int64)
+                        values = np.empty(0, dtype=np.float32)
             order = np.argsort(keys, kind='stable')
             keys = np.ascontiguousarray(keys[order])
             values = np.ascontiguousarray(values[order])
@@ -332,13 +374,41 @@ class DirectSingleHopScorer:
 
     def update_state(self, events, ts):
         rel_exp = self.decay_direct * (float(ts) - self.time_shift)
-        if rel_exp > 700.0:
+        if not math.isfinite(rel_exp):
+            self._clear_all(where='update_state', reason=f'non-finite decay exponent rel_exp={rel_exp}, ts={ts}, time_shift={self.time_shift}')
+            self.time_shift = float(ts)
+            weight = 1.0
+        elif rel_exp > 700.0:
             scale = 2.0 ** (-rel_exp)
-            for key in self.V_sr_sum:
-                self.V_sr_sum[key] *= scale
-            for inner in self.V_sr.values():
-                for obj in inner:
-                    inner[obj] *= scale
+            if scale == 0.0:
+                self._clear_all(where='update_state', reason=f'decay scale underflowed to zero; rel_exp={rel_exp}, ts={ts}')
+            else:
+                invalid = []
+                for key in list(self.V_sr_sum.keys()):
+                    old_sum = float(self.V_sr_sum.get(key, 0.0))
+                    new_sum = old_sum * scale if math.isfinite(old_sum) else 0.0
+                    if new_sum <= 0.0 or not math.isfinite(new_sum):
+                        invalid.append(key)
+                    else:
+                        self.V_sr_sum[key] = new_sum
+                for key, inner in list(self.V_sr.items()):
+                    if key in invalid:
+                        continue
+                    bad = False
+                    for obj in list(inner.keys()):
+                        old_value = float(inner[obj])
+                        new_value = old_value * scale if math.isfinite(old_value) else 0.0
+                        if new_value < 0.0 or not math.isfinite(new_value):
+                            bad = True
+                            break
+                        if new_value == 0.0:
+                            del inner[obj]
+                        else:
+                            inner[obj] = new_value
+                    if bad or not inner:
+                        invalid.append(key)
+                for key in set(invalid):
+                    self._clear_sr(key, where='update_state', reason=f'scaling produced invalid bucket state; rel_exp={rel_exp}, scale={scale}')
             self.time_shift = float(ts)
             weight = 1.0
             self._array_cache.clear()
@@ -346,13 +416,33 @@ class DirectSingleHopScorer:
                 self._sr_version[key] = self._sr_version.get(key, 0) + 1
         else:
             weight = 2.0 ** rel_exp
+        if weight <= 0.0 or not math.isfinite(weight):
+            raise RuntimeError(f'DSH produced invalid update weight: ts={ts}, rel_exp={rel_exp}, weight={weight}')
 
         dirty = set()
         for s, r, o in events[:, :3].astype(np.int64, copy=False):
             sr = self._sr_key(s, r)
+            existing_sum = float(self.V_sr_sum.get(sr, 0.0))
+            bucket = self.V_sr.get(sr)
+            if bucket is not None and (existing_sum <= 0.0 or not math.isfinite(existing_sum)):
+                self._clear_sr(sr, where='update_state', reason=f'existing bucket total invalid before update: total={existing_sum}')
             bucket = self.V_sr.setdefault(sr, {})
-            bucket[int(o)] = bucket.get(int(o), 0.0) + weight
-            self.V_sr_sum[sr] = self.V_sr_sum.get(sr, 0.0) + weight
+            old_value = float(bucket.get(int(o), 0.0))
+            if old_value < 0.0 or not math.isfinite(old_value):
+                self._clear_sr(sr, where='update_state', reason=f'existing bucket value invalid before update: object={int(o)}, value={old_value}')
+                bucket = self.V_sr.setdefault(sr, {})
+                old_value = 0.0
+                existing_sum = 0.0
+            new_value = old_value + weight
+            new_sum = float(self.V_sr_sum.get(sr, 0.0)) + weight
+            if new_value < 0.0 or new_sum <= 0.0 or not math.isfinite(new_value) or not math.isfinite(new_sum):
+                self._clear_sr(sr, where='update_state', reason=f'update would create invalid state: object={int(o)}, new_value={new_value}, new_sum={new_sum}, weight={weight}')
+                bucket = self.V_sr.setdefault(sr, {})
+                bucket[int(o)] = weight
+                self.V_sr_sum[sr] = weight
+            else:
+                bucket[int(o)] = new_value
+                self.V_sr_sum[sr] = new_sum
             dirty.add(sr)
         for sr in dirty:
             self._mark_dirty(sr)
@@ -379,7 +469,11 @@ class DirectSingleHopScorer:
                 end += 1
             bucket = self.V_sr.get(sr)
             total = self.V_sr_sum.get(sr, 0.0)
-            if not bucket or total <= 0.0:
+            if not bucket:
+                start = end
+                continue
+            if total <= 0.0 or not math.isfinite(float(total)):
+                self._clear_sr(sr, where='predict_batch', reason=f'invalid total before prediction: total={total}')
                 start = end
                 continue
 
@@ -3085,7 +3179,7 @@ def make_new_result_dir(args):
     if args.dict_mode == 'per_rel':
         common['top_kr'] = args.top_k_relation
         common['prtm'] = int(args.per_rel_use_mtrans)
-    return make_dir_name('results_new_structure', args.dataset, args.seed, **common)
+    return make_dir_name(getattr(args, 'output_root', 'results_new_structure'), args.dataset, args.seed, **common)
 
 
 def build_runtime(args, num_nodes, num_rels, device):
@@ -3243,8 +3337,14 @@ def validate_args(args):
         raise ValueError('--ns_q must be -1 or a positive integer')
     if not 0.0 <= float(args.train_predict_ratio) <= 1.0:
         raise ValueError('--train_predict_ratio must be in [0, 1]')
+    if args.dict_mode not in ('tag_sum', 'tag_max', 'per_rel'):
+        raise ValueError("--dict_mode must be one of: tag_sum, tag_max, per_rel")
+    if args.shared_w not in ('dual_msim', 'cross_msim', 'unweighted'):
+        raise ValueError("--shared_w must be one of: dual_msim, cross_msim, unweighted")
     if args.dict_mode == 'per_rel' and int(args.top_k_relation) <= 0:
         raise ValueError('--top_k_relation must be > 0 when --dict_mode per_rel')
+    if int(args.top_k_relation) < 0:
+        raise ValueError('--top_k_relation must be >= 0')
     if int(args.ppr_k) <= 0:
         raise ValueError('--ppr_k must be > 0')
     if int(args.batch_size) <= 0:
@@ -3253,8 +3353,20 @@ def validate_args(args):
         raise ValueError('--max_events_in_single_batch must be > 0')
     if int(args.source_join_threads) < 0:
         raise ValueError('--source_join_threads must be >= 0')
-    if int(getattr(args, 'top_direct', -1)) < -1:
-        raise ValueError('--top_direct must be -1 or non-negative')
+    if int(getattr(args, 'top_direct', -1)) != -1 and int(getattr(args, 'top_direct', -1)) < 1:
+        raise ValueError('--top_direct must be -1 or a positive integer')
+    if int(getattr(args, 'top_share', -1)) < -1:
+        raise ValueError('--top_share must be -1, 0, or a positive integer')
+    if not math.isfinite(float(args.ppr_alpha)) or not 0.0 <= float(args.ppr_alpha) <= 1.0:
+        raise ValueError('--ppr_alpha must be finite and in [0, 1]')
+    if not math.isfinite(float(args.ppr_beta)) or not 0.0 < float(args.ppr_beta) < 1.0:
+        raise ValueError('--ppr_beta must be finite and in (0, 1)')
+    if not math.isfinite(float(args.decay_rel_trans)) or float(args.decay_rel_trans) < 0.0:
+        raise ValueError('--decay_rel_trans must be finite and >= 0')
+    if not math.isfinite(float(args.window_semantic_sim)) or float(args.window_semantic_sim) < 0.0:
+        raise ValueError('--window_semantic_sim must be finite and >= 0')
+    if not math.isfinite(float(args.window_trans)) or float(args.window_trans) < 0.0:
+        raise ValueError('--window_trans must be finite and >= 0')
 
 
 EXPECTED_EVAL_QUERIES = {
@@ -3317,10 +3429,12 @@ def validate_new_args(args):
         raise ValueError('--direct_single_hop is required')
     if not hasattr(args, 'decay_direct'):
         raise ValueError('--decay_direct is required')
-    if not 0.0 <= float(args.direct_single_hop) <= 1.0:
+    if not math.isfinite(float(args.direct_single_hop)) or not 0.0 <= float(args.direct_single_hop) <= 1.0:
         raise ValueError('--direct_single_hop must be in [0, 1]')
-    if float(args.gamma) < 0.0:
-        raise ValueError('--gamma must be >= 0')
+    if not math.isfinite(float(args.gamma)) or float(args.gamma) < 0.0:
+        raise ValueError('--gamma must be finite and >= 0')
+    if not math.isfinite(float(args.decay_direct)) or float(args.decay_direct) < 0.0:
+        raise ValueError('--decay_direct must be finite and >= 0')
 
 
 def main(args):
