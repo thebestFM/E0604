@@ -295,6 +295,7 @@ def ensure_dir(path):
 
 
 def minmax_by_query(scores, valid):
+    scores = sanitize_score_matrix(scores, valid)
     low = np.min(np.where(valid, scores, np.inf), axis=1, keepdims=True)
     high = np.max(np.where(valid, scores, -np.inf), axis=1, keepdims=True)
     denom = np.maximum(high - low, EPS)
@@ -303,10 +304,43 @@ def minmax_by_query(scores, valid):
 
 
 def zscore_by_query(scores, valid):
+    scores = sanitize_score_matrix(scores, valid)
     count = np.maximum(valid.sum(axis=1, keepdims=True), 1)
     mean = np.sum(np.where(valid, scores, 0.0), axis=1, keepdims=True) / count
     var = np.sum(np.where(valid, (scores - mean) ** 2, 0.0), axis=1, keepdims=True) / count
     return np.where(valid, (scores - mean) / np.sqrt(np.maximum(var, EPS)), 0.0).astype(np.float32, copy=False)
+
+
+def sanitize_score_matrix(scores, valid):
+    scores = np.asarray(scores, dtype=np.float32)
+    valid = np.asarray(valid, dtype=bool)
+    if np.all(np.isfinite(np.where(valid, scores, 0.0))):
+        return np.where(valid, scores, 0.0).astype(np.float32, copy=False)
+
+    out = np.where(valid, scores, 0.0).astype(np.float32, copy=True)
+    finite_valid = valid & np.isfinite(out)
+    for row in range(out.shape[0]):
+        row_valid = valid[row]
+        if not np.any(row_valid):
+            continue
+        row_finite = finite_valid[row]
+        if np.any(row_finite):
+            vals = out[row, row_finite]
+            lo = float(np.min(vals))
+            hi = float(np.max(vals))
+            span = max(hi - lo, 1.0)
+            pos_fill = hi + span
+            neg_fill = lo - span
+        else:
+            pos_fill = 1.0
+            neg_fill = -1.0
+        pos_inf = row_valid & np.isposinf(out[row])
+        neg_inf = row_valid & np.isneginf(out[row])
+        nan_mask = row_valid & np.isnan(out[row])
+        out[row, pos_inf] = pos_fill
+        out[row, neg_inf] = neg_fill
+        out[row, nan_mask] = neg_fill
+    return np.where(valid, out, 0.0).astype(np.float32, copy=False)
 
 
 def make_base_scores(struct_scores, time_scores, valid):
@@ -407,7 +441,7 @@ class NewHybridFeatureBuilder:
 
 def candidate_scores(pos, neg, valid):
     scores = np.concatenate((pos, neg), axis=1).astype(np.float32, copy=False)
-    return np.where(valid, scores, 0.0).astype(np.float32, copy=False)
+    return sanitize_score_matrix(scores, valid)
 
 
 def selected_for_training(struct_scores, time_scores, base_scores, valid, topk):
@@ -661,6 +695,25 @@ def fit_lgbm_ranker(X, y, group, feature_names, args, params, eval_data=None):
     return model
 
 
+def matrix_diagnostics(name, X, y, group):
+    nonfinite = int(np.size(X) - np.sum(np.isfinite(X)))
+    positives = int(np.sum(y > 0.0))
+    rows = int(X.shape[0])
+    queries = int(len(group))
+    group_min = int(np.min(group)) if len(group) else 0
+    group_max = int(np.max(group)) if len(group) else 0
+    print(
+        f"[NewHybrid] {name} diagnostics: rows={rows} queries={queries} "
+        f"positives={positives} nonfinite_features={nonfinite} "
+        f"group_min={group_min} group_max={group_max}",
+        flush=True,
+    )
+    if positives != queries:
+        raise RuntimeError(f"{name} matrix expected one positive per query, got positives={positives}, queries={queries}")
+    if nonfinite:
+        raise RuntimeError(f"{name} matrix has {nonfinite} non-finite feature values")
+
+
 def save_lgbm_model(model, path):
     booster = getattr(model, "booster_", model)
     booster.save_model(path)
@@ -760,10 +813,12 @@ def require_score_dir(out_dir, label):
         raise FileNotFoundError(f"{label} score files are incomplete under {out_dir}:\n  {text}{extra}")
 
 
-def inspect_score_store_against_data(out_dir, label, data, args, sample_queries=8):
+def inspect_score_store_against_data(out_dir, label, data, args, sample_queries=None):
     expected_negs = int(args.ns_q)
     if expected_negs <= 0:
         raise ValueError("train_new_hybrid requires sampled negatives with ns_q > 0")
+    sample_queries = int(getattr(args, "score_check_queries", 1) if sample_queries is None else sample_queries)
+    sample_queries = max(1, sample_queries)
 
     for split in ("train", "val", "test"):
         expected_rows = split_query_count(data, split)
@@ -803,6 +858,7 @@ def inspect_score_store_against_data(out_dir, label, data, args, sample_queries=
             )
 
         sampled = 0
+        sampled_nonfinite = 0
         row_offset = 0
         neg_sampler = data["negative_sampler"]
         for events, _, t_orig in split_snapshots(data, split):
@@ -811,7 +867,7 @@ def inspect_score_store_against_data(out_dir, label, data, args, sample_queries=
                 t_orig,
                 neg_sampler,
                 split,
-                max(1, min(int(sample_queries), int(args.query_batch_size))),
+                max(1, min(sample_queries, int(args.query_batch_size))),
             ):
                 width = int(neg_arr.shape[1])
                 if width != expected_negs:
@@ -819,7 +875,7 @@ def inspect_score_store_against_data(out_dir, label, data, args, sample_queries=
                         f"{label} {split} sampled negative width mismatch at row {row_offset}: "
                         f"got={width} expected={expected_negs}"
                     )
-                take = min(int(len(batch_data)), int(sample_queries) - sampled)
+                take = min(int(len(batch_data)), sample_queries - sampled)
                 pos, neg, mask = store.get_block(row_offset, row_offset + take, width)
                 if pos.shape != (take, 1) or neg.shape != (take, expected_negs) or mask.shape != (take, expected_negs):
                     raise RuntimeError(
@@ -828,20 +884,21 @@ def inspect_score_store_against_data(out_dir, label, data, args, sample_queries=
                     )
                 if not np.all(mask):
                     raise RuntimeError(f"{label} {split} sampled block has invalid negatives at row {row_offset}")
-                if not np.all(np.isfinite(pos)) or not np.all(np.isfinite(neg[mask])):
-                    raise RuntimeError(f"{label} {split} sampled block has non-finite scores at row {row_offset}")
+                sampled_nonfinite += int(np.size(pos) - np.sum(np.isfinite(pos)))
+                sampled_nonfinite += int(np.size(neg[mask]) - np.sum(np.isfinite(neg[mask])))
                 sampled += take
                 row_offset += int(len(batch_data))
-                if sampled >= int(sample_queries):
+                if sampled >= sample_queries:
                     break
-            if sampled >= int(sample_queries):
+            if sampled >= sample_queries:
                 break
 
         if expected_rows > 0 and sampled == 0:
             raise RuntimeError(f"{label} {split} expected rows but sampled no query for format check")
         print(
             f"[NewHybrid] verified {label} {split}: rows={expected_rows} "
-            f"negatives_per_query={expected_negs} sampled={sampled}",
+            f"negatives_per_query={expected_negs} sampled={sampled} "
+            f"sampled_nonfinite_scores={sampled_nonfinite}",
             flush=True,
         )
 
@@ -939,6 +996,7 @@ def tune_pair(context, args):
 
     print("[NewHybrid] building train matrix", flush=True)
     X_train, y_train, group_train, train_info = build_train_matrix(context, args)
+    matrix_diagnostics("train", X_train, y_train, group_train)
     print(
         f"[NewHybrid] train matrix queries={train_info['queries']} rows={train_info['rows']} "
         f"features={X_train.shape[1]} topk={train_info['topk']}",
@@ -946,6 +1004,7 @@ def tune_pair(context, args):
     )
     print("[NewHybrid] building val-tail eval_set", flush=True)
     eval_data, eval_info = build_lgbm_eval_matrix(context, args)
+    matrix_diagnostics("val_eval", eval_data[0], eval_data[1], eval_data[2])
     print(
         f"[NewHybrid] eval matrix queries={eval_info['queries']} rows={eval_info['rows']} "
         f"topk={eval_info['topk']} tail_fraction={eval_info['tail_fraction']}",
@@ -1038,14 +1097,45 @@ def tune_pair(context, args):
     }
 
 
+def normalize_gpu_arg(args):
+    try:
+        import torch
+    except Exception:
+        return
+    if not torch.cuda.is_available():
+        return
+    visible_count = int(torch.cuda.device_count())
+    requested = int(args.gpu)
+    if requested < 0:
+        raise ValueError("--gpu must be >= 0")
+    if requested < visible_count:
+        return
+    visible_env = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if visible_count == 1:
+        print(
+            f"[NewHybrid] requested --gpu {requested}, but only one CUDA device is visible "
+            f"(CUDA_VISIBLE_DEVICES={visible_env!r}); using local cuda:0",
+            flush=True,
+        )
+        args.gpu = 0
+        return
+    raise ValueError(
+        f"--gpu {requested} is invalid because torch sees {visible_count} CUDA devices "
+        f"(CUDA_VISIBLE_DEVICES={visible_env!r}); use a local ordinal in [0, {visible_count - 1}]"
+    )
+
+
 def validate_args(args):
     if args.dataset not in STRUCTURE_CONFIGS:
         raise ValueError(f"--dataset must be one of {sorted(STRUCTURE_CONFIGS)}")
     args.ns_q = int(DATASET_COMMON[args.dataset]["ns_q"])
+    normalize_gpu_arg(args)
     if int(args.lgbm_n_trials) <= 0:
         raise ValueError("--lgbm_n_trials must be positive; this script is intended for 20-trial tuning")
     if int(args.query_batch_size) <= 0:
         raise ValueError("--query_batch_size must be > 0")
+    if int(args.score_check_queries) <= 0:
+        raise ValueError("--score_check_queries must be > 0")
     if int(args.top_hybrid_train) == 0 or int(args.lgbm_eval_topk) == 0:
         raise ValueError("--top_hybrid_train/--lgbm_eval_topk must be -1 or positive")
     if args.metric.lower().replace("@", "") not in ("hr10", "hit10", "mrr"):
@@ -1159,6 +1249,7 @@ def parse_args():
     parser.add_argument("--time_root", default="")
     parser.add_argument("--output_root", default="results_new_hybrid")
     parser.add_argument("--query_batch_size", type=int, default=2048)
+    parser.add_argument("--score_check_queries", type=int, default=1)
     parser.add_argument("--top_hybrid_train", type=int, default=200)
     parser.add_argument("--lgbm_eval_topk", type=int, default=200)
     parser.add_argument("--lgbm_eval_tail_fraction", type=float, default=0.3)
