@@ -315,8 +315,12 @@ class DirectSingleHopScorer:
             keys = np.empty(0, dtype=np.int64)
             values = np.empty(0, dtype=np.float32)
         else:
+            total = float(self.V_sr_sum.get(sr, 0.0))
             keys = np.fromiter(bucket.keys(), dtype=np.int64, count=len(bucket))
-            values = np.fromiter(bucket.values(), dtype=np.float32, count=len(bucket))
+            if total > 0.0 and math.isfinite(total):
+                values = np.fromiter((float(v) / total for v in bucket.values()), dtype=np.float32, count=len(bucket))
+            else:
+                values = np.zeros(len(bucket), dtype=np.float32)
             order = np.argsort(keys, kind='stable')
             keys = np.ascontiguousarray(keys[order])
             values = np.ascontiguousarray(values[order])
@@ -387,7 +391,7 @@ class DirectSingleHopScorer:
                     neg_samples,
                     pos,
                     neg,
-                    np.float32(1.0 / total),
+                    np.float32(1.0),
                 )
             start = end
 
@@ -3042,7 +3046,7 @@ def run_inference(predictor, direct_scorer, data, args, semantic_updater, logic_
 
 def make_new_result_dir(args):
     common = dict(
-        impl='new_structure_v1',
+        impl='new_structure_v2',
         dict_mode=args.dict_mode,
         shared_w=args.shared_w,
         ppr_k=args.ppr_k,
