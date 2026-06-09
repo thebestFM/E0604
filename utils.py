@@ -853,6 +853,15 @@ def add_metric_sums(total, batch):
         total[key] = total.get(key, 0.0) + value
 
 
+def add_rank_sums(total, loose_ranks, strict_ranks, avg_ranks, hit_ks=HIT_KS):
+    total["count"] = total.get("count", 0) + int(len(loose_ranks))
+    for label, ranks in (("loose", loose_ranks), ("strict", strict_ranks), ("avg", avg_ranks)):
+        total[f"mrr_{label}"] = total.get(f"mrr_{label}", 0.0) + float(np.sum(1.0 / ranks))
+        for k in hit_ks:
+            key = f"hit@{k}_{label}"
+            total[key] = total.get(key, 0.0) + float(np.sum(ranks <= int(k)))
+
+
 def finalize_metric_sums(sums, hit_ks=HIT_KS):
     count = int(sums.get("count", 0))
     if count <= 0:
@@ -863,6 +872,15 @@ def finalize_metric_sums(sums, hit_ks=HIT_KS):
             metrics[f"hit@{k}_avg"] = 0.0
         return metrics
     return {key: float(value) / count for key, value in sums.items() if key != "count"}
+
+
+def dense_rank(scores, valid):
+    masked = np.where(valid, scores, -np.inf)
+    order = np.argsort(-masked, axis=1, kind="stable")
+    ranks = np.empty(order.shape, dtype=np.int32)
+    rows = np.arange(order.shape[0])[:, None]
+    ranks[rows, order] = np.arange(1, order.shape[1] + 1, dtype=np.int32)
+    return np.where(valid, ranks, order.shape[1] + 1)
 
 
 class ScoreWriter:
@@ -909,6 +927,36 @@ class ScoreWriter:
         }
         with open(osp.join(self.out_dir, f"{self.mode}_meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
+
+
+class ScoreStore:
+    def __init__(self, out_dir, mode):
+        _, _, load_npz, _ = _sparse_tools()
+        self.out_dir = out_dir
+        self.mode = mode
+        self.pos = np.load(osp.join(out_dir, f"{mode}_pos.npy"))
+        if self.pos.ndim == 1:
+            self.pos = self.pos.reshape(-1, 1)
+        self.neg = load_npz(osp.join(out_dir, f"{mode}_neg.npz")).tocsr()
+        self.valid_lens = np.load(osp.join(out_dir, f"{mode}_valid_lens.npy")).astype(np.int32)
+        self.num_rows = int(self.pos.shape[0])
+        self.max_negs = int(self.neg.shape[1])
+
+    def get_block(self, start, end, width):
+        if end > self.num_rows:
+            raise ValueError(f"score row overflow: {self.out_dir}/{self.mode}, end={end}, rows={self.num_rows}")
+        width = min(int(width), self.max_negs)
+        neg = self.neg[start:end, :width]
+        if neg.dtype != np.float32:
+            neg = neg.astype(np.float32)
+        neg = neg.toarray().astype(np.float32, copy=False)
+        lens = np.minimum(self.valid_lens[start:end], width)
+        mask = np.arange(width)[None, :] < lens[:, None]
+        return (
+            self.pos[start:end].astype(np.float32, copy=False),
+            np.where(mask, neg, 0.0).astype(np.float32, copy=False),
+            mask,
+        )
 
 
 def describe_loaded_data(data, prefix="[data]"):

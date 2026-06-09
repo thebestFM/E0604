@@ -12,9 +12,11 @@ from types import SimpleNamespace
 import numpy as np
 
 import train_new_structure
-from single_pipeline.structure_combine_single import ScoreStore, add_rank_sums, dense_rank
 from utils import (
+    ScoreStore,
+    add_rank_sums,
     collect_eval_batch,
+    dense_rank,
     describe_loaded_data,
     finalize_metric_sums,
     is_run_complete,
