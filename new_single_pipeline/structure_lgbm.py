@@ -530,6 +530,43 @@ def iter_structure_blocks(data, split, args, feature_builder, device):
         history.update(update_events)
 
 
+def iter_component_blocks(data, split, args, device):
+    runtime, timeline, history = init_stream_state(data, split, args, device)
+    neg_sampler = data["negative_sampler"]
+    snapshots = split_snapshots(data, split)
+    for events, t_norm, t_orig in snapshots:
+        for batch_data, neg_arr, neg_mask in collect_eval_batch(events, t_orig, neg_sampler, split, args.query_batch_size):
+            width = int(neg_arr.shape[1])
+            parts = runtime.predict_parts(batch_data, neg_arr)
+            rels, pos_counts, neg_counts = timeline.count_batch(batch_data, neg_arr, width)
+            b_pos, b_neg = timeline.score_batch(rels, pos_counts, neg_counts, args.b_cfg)
+            valid = np.concatenate((np.ones((len(batch_data), 1), dtype=bool), neg_mask[:, :width]), axis=1)
+            cand_ids = np.concatenate((batch_data[:, 2:3], neg_arr[:, :width]), axis=1)
+            cand_ids = np.where(valid, cand_ids, -1).astype(np.int64, copy=False)
+            b_counts = np.concatenate((pos_counts.reshape(-1, 1), neg_counts), axis=1).astype(np.float32, copy=False)
+            scores = component_score_dict(parts, b_pos, b_neg, valid)
+            history_values = history.features(
+                batch_data[:, 0].astype(np.int64, copy=False),
+                batch_data[:, 1].astype(np.int64, copy=False),
+                cand_ids,
+                b_counts,
+            )
+            yield SimpleNamespace(
+                batch_data=batch_data,
+                valid=valid,
+                scores=scores,
+                cand_ids=cand_ids,
+                b_counts=b_counts,
+                history_values=history_values,
+                t_norm=t_norm,
+                t_orig=t_orig,
+            )
+        update_events = events_for_update(events, data, args, is_train=(split == "train"))
+        runtime.update(update_events, t_norm)
+        timeline.update(update_events)
+        history.update(update_events)
+
+
 def build_structure_matrix(data, split, args, feature_builder, device, topk):
     X_parts = []
     y_parts = []
@@ -748,6 +785,148 @@ class HybridFeatureBuilder:
         return cube
 
 
+class RescueHybridFeatureBuilder:
+    def __init__(self, num_rels):
+        self.num_rels = int(num_rels)
+        self.feature_names = []
+        self._init_names()
+
+    def _add(self, name):
+        self.feature_names.append(name)
+
+    def _init_names(self):
+        for prefix in ("structure_raw", "time", "dsh", "dmh", "direct", "shared", "b", "base", "time_structure_base"):
+            self._add(f"{prefix}_score")
+            self._add(f"{prefix}_z")
+            self._add(f"{prefix}_minmax")
+            self._add(f"{prefix}_rank_log")
+            self._add(f"{prefix}_rank_recip")
+            self._add(f"{prefix}_top10")
+            self._add(f"{prefix}_top50")
+            self._add(f"{prefix}_top100")
+        for name in (
+            "structure_minus_time",
+            "direct_minus_time",
+            "dsh_minus_time",
+            "dmh_minus_time",
+            "shared_minus_time",
+            "b_minus_time",
+            "abs_structure_minus_time",
+            "structure_times_time",
+            "direct_times_time",
+            "component_mean",
+            "component_max",
+            "component_min",
+            "component_std",
+            "rank_min_structure_time",
+            "rank_gap_structure_time",
+            "rank_gap_direct_time",
+            "structure_and_time_top10",
+            "structure_or_time_top10",
+            "structure_and_time_top50",
+            "structure_or_time_top50",
+            "b_count_log1p",
+            "b_seen",
+            "tail_count_log1p",
+            "incident_count_log1p",
+            "rel_tail_count_log1p",
+            "source_count_log1p",
+            "rel_count_log1p",
+            "source_rel_log1p",
+            "exact_sro_log1p",
+            "source_tail_log1p",
+            "relation_is_inverse",
+            "candidate_is_source",
+        ):
+            self._add(name)
+
+    def make(self, scores, time_scores, valid, batch_data, cand_ids, b_counts=None, history_values=None):
+        score_map = {
+            "structure_raw": scores["structure_raw"],
+            "time": time_scores,
+            "dsh": scores["dsh"],
+            "dmh": scores["dmh"],
+            "direct": scores["direct"],
+            "shared": scores["shared"],
+            "b": scores["b"],
+            "base": scores["base"],
+        }
+        score_map["time_structure_base"] = (
+            (minmax_by_query(score_map["structure_raw"], valid) + minmax_by_query(time_scores, valid)) * 0.5
+        ).astype(np.float32, copy=False)
+        ranks = {name: dense_rank(value, valid).astype(np.float32, copy=False) for name, value in score_map.items()}
+
+        features = []
+        for prefix in ("structure_raw", "time", "dsh", "dmh", "direct", "shared", "b", "base", "time_structure_base"):
+            score = np.where(valid, score_map[prefix], 0.0).astype(np.float32, copy=False)
+            rank = ranks[prefix]
+            features.extend(
+                [
+                    score,
+                    zscore_by_query(score, valid),
+                    minmax_by_query(score, valid),
+                    np.log1p(rank).astype(np.float32, copy=False),
+                    (1.0 / np.maximum(rank, 1.0)).astype(np.float32, copy=False),
+                    ((rank <= 10) & valid).astype(np.float32),
+                    ((rank <= 50) & valid).astype(np.float32),
+                    ((rank <= 100) & valid).astype(np.float32),
+                ]
+            )
+
+        structure = score_map["structure_raw"]
+        time_score = score_map["time"]
+        direct = score_map["direct"]
+        dsh = score_map["dsh"]
+        dmh = score_map["dmh"]
+        shared = score_map["shared"]
+        b = score_map["b"]
+        stack = np.stack([structure, time_score, dsh, dmh, direct, shared, b, score_map["base"]], axis=2)
+        sr = ranks["structure_raw"]
+        tr = ranks["time"]
+        dr = ranks["direct"]
+        features.extend(
+            [
+                (structure - time_score).astype(np.float32, copy=False),
+                (direct - time_score).astype(np.float32, copy=False),
+                (dsh - time_score).astype(np.float32, copy=False),
+                (dmh - time_score).astype(np.float32, copy=False),
+                (shared - time_score).astype(np.float32, copy=False),
+                (b - time_score).astype(np.float32, copy=False),
+                np.abs(structure - time_score).astype(np.float32, copy=False),
+                (structure * time_score).astype(np.float32, copy=False),
+                (direct * time_score).astype(np.float32, copy=False),
+                np.mean(stack, axis=2).astype(np.float32, copy=False),
+                np.max(stack, axis=2).astype(np.float32, copy=False),
+                np.min(stack, axis=2).astype(np.float32, copy=False),
+                np.std(stack, axis=2).astype(np.float32, copy=False),
+                np.minimum(sr, tr).astype(np.float32, copy=False),
+                np.abs(sr - tr).astype(np.float32, copy=False),
+                np.abs(dr - tr).astype(np.float32, copy=False),
+                ((sr <= 10) & (tr <= 10) & valid).astype(np.float32),
+                (((sr <= 10) | (tr <= 10)) & valid).astype(np.float32),
+                ((sr <= 50) & (tr <= 50) & valid).astype(np.float32),
+                (((sr <= 50) | (tr <= 50)) & valid).astype(np.float32),
+            ]
+        )
+        if b_counts is None:
+            b_counts = np.zeros_like(structure, dtype=np.float32)
+        features.append(np.log1p(np.maximum(b_counts, 0.0)).astype(np.float32, copy=False))
+        features.append((b_counts > 0).astype(np.float32, copy=False))
+        if history_values is None:
+            history_values = [np.zeros_like(structure, dtype=np.float32) for _ in range(8)]
+        for arr in history_values:
+            features.append(np.log1p(np.maximum(arr, 0.0)).astype(np.float32, copy=False))
+        rels = batch_data[:, 1].astype(np.int64, copy=False)
+        sources = batch_data[:, 0].astype(np.int64, copy=False)
+        features.append((rels.reshape(-1, 1) >= self.num_rels // 2).repeat(valid.shape[1], axis=1).astype(np.float32))
+        features.append((cand_ids == sources.reshape(-1, 1)).astype(np.float32, copy=False))
+        cube = np.stack(features, axis=2).astype(np.float32, copy=False)
+        bad = int(np.size(cube) - np.sum(np.isfinite(cube)))
+        if bad:
+            raise RuntimeError(f"rescue hybrid feature cube has {bad} non-finite values")
+        return cube
+
+
 def base_hybrid_scores(struct_scores, time_scores, valid):
     return ((minmax_by_query(struct_scores, valid) + minmax_by_query(time_scores, valid)) * 0.5).astype(
         np.float32, copy=False
@@ -938,6 +1117,243 @@ def evaluate_hybrid_model(
             top10_f.close()
     metrics = finalize_metric_sums(sums)
     metrics["num_queries"] = int(sums.get("count", 0))
+    return metrics
+
+
+def iter_rescue_hybrid_blocks(data, split, args, rescue_feature_builder, time_dir, device):
+    time_store = ScoreStore(time_dir, split)
+    row_offset = 0
+    for block in iter_component_blocks(data, split, args, device):
+        width = block.valid.shape[1] - 1
+        end = row_offset + block.valid.shape[0]
+        time_pos, time_neg, time_mask = time_store.get_block(row_offset, end, width)
+        time_valid = np.concatenate((np.ones((len(time_pos), 1), dtype=bool), time_mask), axis=1)
+        valid = block.valid & time_valid
+        time_scores = np.concatenate((time_pos, time_neg), axis=1).astype(np.float32, copy=False)
+        time_scores = np.where(valid, time_scores, 0.0).astype(np.float32, copy=False)
+        features = rescue_feature_builder.make(
+            block.scores,
+            time_scores,
+            valid,
+            block.batch_data,
+            block.cand_ids,
+            b_counts=block.b_counts,
+            history_values=block.history_values,
+        )
+        yield SimpleNamespace(
+            batch_data=block.batch_data,
+            valid=valid,
+            scores=block.scores,
+            time_scores=time_scores,
+            cand_ids=block.cand_ids,
+            features=features,
+            t_norm=block.t_norm,
+            t_orig=block.t_orig,
+        )
+        row_offset = end
+    if row_offset != time_store.num_rows:
+        raise RuntimeError(f"time row count mismatch for split={split}: stream={row_offset}, store={time_store.num_rows}")
+
+
+def rescue_topk_mask(structure_scores, valid, topk):
+    ranks = dense_rank(structure_scores, valid)
+    return (ranks <= int(topk)) & valid, ranks
+
+
+def build_rescue_hybrid_matrix(
+    data,
+    split,
+    args,
+    rescue_feature_builder,
+    time_dir,
+    device,
+    topk,
+    min_pos_rank=1,
+    max_pos_rank=100,
+    include_top10=True,
+):
+    X_parts = []
+    y_parts = []
+    groups = []
+    queries = 0
+    rows = 0
+    skipped_pos_after_topk = 0
+    preserve_queries = 0
+    rescue_queries = 0
+    for block in iter_rescue_hybrid_blocks(data, split, args, rescue_feature_builder, time_dir, device):
+        selected, ranks = rescue_topk_mask(block.scores["structure_raw"], block.valid, topk)
+        pos_ranks = ranks[:, 0]
+        for row in range(selected.shape[0]):
+            pos_rank = int(pos_ranks[row])
+            if pos_rank > int(max_pos_rank):
+                skipped_pos_after_topk += 1
+                continue
+            if pos_rank < int(min_pos_rank) and not include_top10:
+                continue
+            cols = np.flatnonzero(selected[row])
+            if len(cols) <= 1 or 0 not in cols:
+                skipped_pos_after_topk += 1
+                continue
+            labels = np.zeros(len(cols), dtype=np.float32)
+            labels[int(np.flatnonzero(cols == 0)[0])] = 1.0
+            X_parts.append(block.features[row, cols, :])
+            y_parts.append(labels)
+            groups.append(len(cols))
+            queries += 1
+            rows += len(cols)
+            if pos_rank <= 10:
+                preserve_queries += 1
+            else:
+                rescue_queries += 1
+    if not X_parts:
+        raise RuntimeError(f"no rescue hybrid rows built for split={split}")
+    positives = int(np.sum(np.concatenate(y_parts) > 0.0))
+    if positives != queries:
+        raise RuntimeError(f"rescue hybrid matrix expected one positive per query, got positives={positives}, queries={queries}")
+    nonfinite = int(sum(np.size(x) - np.sum(np.isfinite(x)) for x in X_parts))
+    if nonfinite:
+        raise RuntimeError(f"rescue hybrid matrix has {nonfinite} non-finite feature values")
+    return (
+        np.vstack(X_parts).astype(np.float32, copy=False),
+        np.concatenate(y_parts).astype(np.float32, copy=False),
+        np.asarray(groups, dtype=np.int32),
+        {
+            "split": split,
+            "queries": int(queries),
+            "rows": int(rows),
+            "topk": int(topk),
+            "min_pos_rank": int(min_pos_rank),
+            "max_pos_rank": int(max_pos_rank),
+            "include_top10": bool(include_top10),
+            "preserve_queries": int(preserve_queries),
+            "rescue_queries": int(rescue_queries),
+            "skipped_pos_after_topk": int(skipped_pos_after_topk),
+        },
+    )
+
+
+def _score_rescue_selected(raw_scores, selected, pred):
+    final = raw_scores.astype(np.float32, copy=True)
+    if not np.any(selected):
+        return final
+    outside = (~selected) & np.isfinite(final)
+    floor = float(np.max(final[outside])) if np.any(outside) else 0.0
+    pred = np.asarray(pred, dtype=np.float32)
+    if pred.size == 0:
+        return final
+    selected_cols = np.flatnonzero(selected)
+    raw_sel = raw_scores[selected_cols].astype(np.float32, copy=False)
+    order = np.lexsort((selected_cols, -raw_sel, -pred))
+    ordered_cols = selected_cols[order]
+    n = int(len(ordered_cols))
+    final[ordered_cols] = floor + 1.0 + ((n - np.arange(n, dtype=np.float32)) / max(n, 1))
+    return final
+
+
+def evaluate_rescue_hybrid_model(
+    data,
+    split,
+    args,
+    rescue_feature_builder,
+    hybrid_model,
+    time_dir,
+    device,
+    topk,
+    save_top10_path=None,
+):
+    sums = {}
+    rescue_stats = {
+        "pos_in_top10_before": 0,
+        "pos_11_100_before": 0,
+        "pos_after_top100_before": 0,
+        "pos_in_top10_after": 0,
+        "rescued_11_100_to_top10": 0,
+        "dropped_top10": 0,
+    }
+    top10_f = None
+    if save_top10_path:
+        ensure_dir(osp.dirname(save_top10_path))
+        top10_f = open(save_top10_path, "w", encoding="utf-8")
+    query_idx = 0
+    try:
+        for block in iter_rescue_hybrid_blocks(data, split, args, rescue_feature_builder, time_dir, device):
+            selected, ranks = rescue_topk_mask(block.scores["structure_raw"], block.valid, topk)
+            loose = []
+            strict = []
+            avg = []
+            for row in range(block.valid.shape[0]):
+                valid_cols = np.flatnonzero(block.valid[row])
+                sel_cols = np.flatnonzero(selected[row])
+                raw_scores = np.where(block.valid[row], block.scores["structure_raw"][row], -np.inf).astype(np.float32)
+                before_rank = int(ranks[row, 0])
+                if before_rank <= 10:
+                    rescue_stats["pos_in_top10_before"] += 1
+                elif before_rank <= int(topk):
+                    rescue_stats["pos_11_100_before"] += 1
+                else:
+                    rescue_stats["pos_after_top100_before"] += 1
+                if len(sel_cols):
+                    X = block.features[row, sel_cols, :].astype(np.float32, copy=False)
+                    pred = predict_lgbm(hybrid_model, X)
+                    final_scores = _score_rescue_selected(raw_scores, selected[row], pred)
+                else:
+                    final_scores = raw_scores
+                    pred = np.empty(0, dtype=np.float32)
+                pos_score = final_scores[0]
+                neg_scores = final_scores[1:]
+                neg_valid = block.valid[row, 1:]
+                l_rank = 1 + int(np.sum((neg_scores > pos_score) & neg_valid))
+                s_rank = 1 + int(np.sum((neg_scores >= pos_score) & neg_valid))
+                loose.append(l_rank)
+                strict.append(s_rank)
+                avg.append((l_rank + s_rank) * 0.5)
+                if s_rank <= 10:
+                    rescue_stats["pos_in_top10_after"] += 1
+                    if 10 < before_rank <= int(topk):
+                        rescue_stats["rescued_11_100_to_top10"] += 1
+                elif before_rank <= 10:
+                    rescue_stats["dropped_top10"] += 1
+                if top10_f is not None:
+                    top = valid_cols[np.argsort(-final_scores[valid_cols], kind="stable")[:10]]
+                    event = block.batch_data[row]
+                    pred_map = {int(col): float(score) for col, score in zip(sel_cols, pred)}
+                    payload = {
+                        "query_index": int(query_idx),
+                        "s": int(event[0]),
+                        "r": int(event[1]),
+                        "o": int(event[2]),
+                        "t_norm": float(block.t_norm),
+                        "t_orig": int(block.t_orig),
+                        "structure_rank_before": int(before_rank),
+                        "strict_rank": int(s_rank),
+                        "loose_rank": int(l_rank),
+                        "top10": [
+                            {
+                                "rank": int(k + 1),
+                                "candidate_id": int(block.cand_ids[row, int(col)]),
+                                "is_positive": bool(int(col) == 0),
+                                "hybrid_score": float(final_scores[int(col)]),
+                                "lgbm_score": pred_map.get(int(col)),
+                                "structure_score": float(block.scores["structure_raw"][row, int(col)]),
+                                "time_score": float(block.time_scores[row, int(col)]),
+                            }
+                            for k, col in enumerate(top)
+                        ],
+                    }
+                    top10_f.write(json.dumps(payload, separators=(",", ":")) + "\n")
+                query_idx += 1
+            add_rank_sums(
+                sums,
+                np.asarray(loose, dtype=np.int64),
+                np.asarray(strict, dtype=np.int64),
+                np.asarray(avg, dtype=np.float64),
+            )
+    finally:
+        if top10_f is not None:
+            top10_f.close()
+    metrics = finalize_metric_sums(sums)
+    metrics["num_queries"] = int(sums.get("count", 0))
+    metrics["rescue_stats"] = rescue_stats
     return metrics
 
 

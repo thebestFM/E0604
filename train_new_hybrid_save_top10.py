@@ -12,14 +12,11 @@ import numpy as np
 
 from new_single_pipeline.structure_lgbm import (
     BConfig,
-    HybridFeatureBuilder,
-    StructureFeatureBuilder,
-    build_hybrid_matrix,
-    build_structure_matrix,
+    RescueHybridFeatureBuilder,
+    build_rescue_hybrid_matrix,
     ensure_dir,
-    evaluate_hybrid_model,
+    evaluate_rescue_hybrid_model,
     evaluate_score_store,
-    evaluate_structure_model,
     fit_lgbm_ranker,
     format_metrics,
     metric_value,
@@ -30,7 +27,7 @@ import train_new_structure as tns
 from utils import describe_loaded_data, load_datasets, ranking_metric_key, save_config, save_metrics, select_torch_device, set_random_seed
 
 
-PROTOCOL = "new_hybrid_save_top10_two_stage_v2"
+PROTOCOL = "new_hybrid_save_top10_rescue_topk_v1"
 REQUIRED_STRUCTURE_IMPL = "new_structure_v3"
 DEFAULT_CONFIG = osp.join("configs", "new_hybrid_inputs.json")
 
@@ -109,6 +106,78 @@ HYBRID_PARAM_PRESETS = [
         "reg_lambda": 1.5,
         "reg_alpha": 0.05,
         "min_split_gain": 0.005,
+        "subsample": 0.9,
+        "colsample_bytree": 0.8,
+    },
+    {
+        "n_estimators": 8,
+        "learning_rate": 0.03,
+        "num_leaves": 31,
+        "max_depth": 8,
+        "min_child_samples": 80,
+        "reg_lambda": 1.0,
+        "reg_alpha": 0.01,
+        "min_split_gain": 0.001,
+        "subsample": 0.95,
+        "colsample_bytree": 0.85,
+    },
+    {
+        "n_estimators": 16,
+        "learning_rate": 0.02,
+        "num_leaves": 31,
+        "max_depth": 10,
+        "min_child_samples": 120,
+        "reg_lambda": 1.5,
+        "reg_alpha": 0.03,
+        "min_split_gain": 0.003,
+        "subsample": 0.9,
+        "colsample_bytree": 0.8,
+    },
+    {
+        "n_estimators": 32,
+        "learning_rate": 0.015,
+        "num_leaves": 47,
+        "max_depth": 10,
+        "min_child_samples": 150,
+        "reg_lambda": 2.0,
+        "reg_alpha": 0.05,
+        "min_split_gain": 0.005,
+        "subsample": 0.9,
+        "colsample_bytree": 0.75,
+    },
+    {
+        "n_estimators": 64,
+        "learning_rate": 0.01,
+        "num_leaves": 63,
+        "max_depth": 12,
+        "min_child_samples": 200,
+        "reg_lambda": 3.0,
+        "reg_alpha": 0.1,
+        "min_split_gain": 0.01,
+        "subsample": 0.85,
+        "colsample_bytree": 0.75,
+    },
+    {
+        "n_estimators": 128,
+        "learning_rate": 0.006,
+        "num_leaves": 63,
+        "max_depth": 12,
+        "min_child_samples": 300,
+        "reg_lambda": 5.0,
+        "reg_alpha": 0.2,
+        "min_split_gain": 0.02,
+        "subsample": 0.85,
+        "colsample_bytree": 0.7,
+    },
+    {
+        "n_estimators": 24,
+        "learning_rate": 0.02,
+        "num_leaves": 15,
+        "max_depth": 7,
+        "min_child_samples": 250,
+        "reg_lambda": 4.0,
+        "reg_alpha": 0.1,
+        "min_split_gain": 0.02,
         "subsample": 0.9,
         "colsample_bytree": 0.8,
     },
@@ -200,6 +269,11 @@ def make_out_dir(args, inputs):
             "train_predict_ratio": args.train_predict_ratio,
             "structure_topk": args.structure_train_topk,
             "hybrid_topk": args.hybrid_train_topk,
+            "rescue_topk": args.rescue_topk,
+            "rescue_min_pos_rank": args.rescue_min_pos_rank,
+            "rescue_max_pos_rank": args.rescue_max_pos_rank,
+            "rescue_exclude_top10": args.rescue_exclude_top10,
+            "hybrid_select_split": args.hybrid_select_split,
             "structure_param_presets": args.structure_param_presets,
             "hybrid_param_presets": args.hybrid_param_presets,
             "max_structure_configs": args.max_structure_configs,
@@ -229,115 +303,69 @@ def require_time_scores(time_dir, label):
         raise FileNotFoundError(f"{label} missing time score files, first missing: {missing[0]}")
 
 
-def train_best_structure(data, sargs, args, device, out_dir, struct_id):
-    feature_builder = StructureFeatureBuilder(data["num_rels"])
-    print(f"[SaveTop10][structure] build train matrix struct={struct_id}", flush=True)
-    X_train, y_train, group, train_info = build_structure_matrix(
-        data,
-        "train",
-        sargs,
-        feature_builder,
-        device,
-        int(args.structure_train_topk),
-    )
+def train_best_rescue_hybrid(data, sargs, args, device, out_dir, struct_id, time_run):
+    rescue_feature_builder = RescueHybridFeatureBuilder(data["num_rels"])
+    time_dir = time_run["dir"]
+    include_top10 = not bool(getattr(args, "rescue_exclude_top10", False))
     print(
-        f"[SaveTop10][structure] train rows={train_info['rows']} queries={train_info['queries']} "
-        f"features={X_train.shape[1]}",
+        f"[SaveTop10][rescue] build train matrix struct={struct_id} time={time_run['id']} "
+        f"topk={int(args.rescue_topk)} pos_rank={int(args.rescue_min_pos_rank)}..{int(args.rescue_max_pos_rank)} "
+        f"include_top10={include_top10}",
         flush=True,
     )
-    best = None
-    records = []
-    for idx, params in enumerate(STRUCTURE_PARAM_PRESETS[: int(args.structure_param_presets)], start=1):
-        print(f"[SaveTop10][structure] preset {idx} params={params}", flush=True)
-        model = fit_lgbm_ranker(
-            X_train,
-            y_train,
-            group,
-            feature_builder.feature_names,
-            feature_builder.categorical_indices,
-            args,
-            params,
-        )
-        val_metrics = evaluate_structure_model(data, "val", sargs, feature_builder, model, device)
-        score = metric_value(val_metrics, args.structure_metric)
-        print(f"[SaveTop10][structure] preset {idx} val {format_metrics(val_metrics)} score={score:.5f}", flush=True)
-        rec = {
-            "preset": idx,
-            "params": dict(params),
-            "val_metrics": val_metrics,
-            "score": float(score),
-            "train_info": train_info,
-        }
-        records.append(rec)
-        if best is None or score > best["score"]:
-            if best is not None:
-                del best["model"]
-                gc.collect()
-            best = {"model": model, "score": float(score), "record": rec}
-        else:
-            del model
-            gc.collect()
-    del X_train, y_train, group
-    gc.collect()
-    model_path = osp.join(out_dir, "structure_models", f"{struct_id}.txt")
-    save_lgbm_model(best["model"], model_path)
-    test_metrics = evaluate_structure_model(data, "test", sargs, feature_builder, best["model"], device)
-    print(f"[SaveTop10][structure] best struct={struct_id} test {format_metrics(test_metrics)}", flush=True)
-    best["record"]["test_metrics"] = test_metrics
-    best["record"]["model_path"] = model_path
-    return best["model"], feature_builder, {"best": best["record"], "all": records}
-
-
-def train_best_hybrid(data, sargs, args, device, out_dir, struct_id, time_run, structure_model, structure_feature_builder):
-    hybrid_feature_builder = HybridFeatureBuilder(data["num_rels"])
-    time_dir = time_run["dir"]
-    print(f"[SaveTop10][hybrid] build train matrix struct={struct_id} time={time_run['id']}", flush=True)
-    X_train, y_train, group, train_info = build_hybrid_matrix(
+    X_train, y_train, group, train_info = build_rescue_hybrid_matrix(
         data,
         "train",
         sargs,
-        structure_feature_builder,
-        hybrid_feature_builder,
-        structure_model,
+        rescue_feature_builder,
         time_dir,
         device,
-        int(args.hybrid_train_topk),
+        int(args.rescue_topk),
+        min_pos_rank=int(args.rescue_min_pos_rank),
+        max_pos_rank=int(args.rescue_max_pos_rank),
+        include_top10=include_top10,
     )
     print(
-        f"[SaveTop10][hybrid] train rows={train_info['rows']} queries={train_info['queries']} "
-        f"features={X_train.shape[1]}",
+        f"[SaveTop10][rescue] train rows={train_info['rows']} queries={train_info['queries']} "
+        f"preserve={train_info['preserve_queries']} rescue={train_info['rescue_queries']} "
+        f"skipped_pos_after_topk={train_info['skipped_pos_after_topk']} features={X_train.shape[1]}",
         flush=True,
     )
     best = None
     records = []
+    select_split = str(args.hybrid_select_split)
     for idx, params in enumerate(HYBRID_PARAM_PRESETS[: int(args.hybrid_param_presets)], start=1):
-        print(f"[SaveTop10][hybrid] preset {idx} params={params}", flush=True)
+        print(f"[SaveTop10][rescue] preset {idx} params={params}", flush=True)
         model = fit_lgbm_ranker(
             X_train,
             y_train,
             group,
-            hybrid_feature_builder.feature_names,
+            rescue_feature_builder.feature_names,
             [],
             args,
             params,
         )
-        val_metrics = evaluate_hybrid_model(
+        select_metrics = evaluate_rescue_hybrid_model(
             data,
-            "val",
+            select_split,
             sargs,
-            structure_feature_builder,
-            hybrid_feature_builder,
-            structure_model,
+            rescue_feature_builder,
             model,
             time_dir,
             device,
+            int(args.rescue_topk),
         )
-        score = metric_value(val_metrics, args.focus_metric)
-        print(f"[SaveTop10][hybrid] preset {idx} val {format_metrics(val_metrics)} score={score:.5f}", flush=True)
+        score = metric_value(select_metrics, args.focus_metric)
+        print(
+            f"[SaveTop10][rescue] preset {idx} {select_split} {format_metrics(select_metrics)} "
+            f"score={score:.5f} stats={select_metrics.get('rescue_stats')}",
+            flush=True,
+        )
         rec = {
             "preset": idx,
             "params": dict(params),
-            "val_metrics": val_metrics,
+            "selection_split": select_split,
+            "selection_metrics": select_metrics,
             "score": float(score),
             "train_info": train_info,
         }
@@ -352,23 +380,26 @@ def train_best_hybrid(data, sargs, args, device, out_dir, struct_id, time_run, s
             gc.collect()
     del X_train, y_train, group
     gc.collect()
-    pair_id = f"{struct_id}__{time_run['id']}"
-    model_path = osp.join(out_dir, "hybrid_models", f"{pair_id}.txt")
+    pair_id = f"{struct_id}__{time_run['id']}__rescue_top{int(args.rescue_topk)}"
+    model_path = osp.join(out_dir, "rescue_models", f"{pair_id}.txt")
     save_lgbm_model(best["model"], model_path)
     top10_path = osp.join(out_dir, "top10", f"{pair_id}.test_top10.jsonl")
-    test_metrics = evaluate_hybrid_model(
+    test_metrics = evaluate_rescue_hybrid_model(
         data,
         "test",
         sargs,
-        structure_feature_builder,
-        hybrid_feature_builder,
-        structure_model,
+        rescue_feature_builder,
         best["model"],
         time_dir,
         device,
+        int(args.rescue_topk),
         save_top10_path=top10_path,
     )
-    print(f"[SaveTop10][hybrid] best pair={pair_id} test {format_metrics(test_metrics)} top10={top10_path}", flush=True)
+    print(
+        f"[SaveTop10][rescue] best pair={pair_id} test {format_metrics(test_metrics)} "
+        f"stats={test_metrics.get('rescue_stats')} top10={top10_path}",
+        flush=True,
+    )
     best["record"].update(
         {
             "test_metrics": test_metrics,
@@ -378,6 +409,7 @@ def train_best_hybrid(data, sargs, args, device, out_dir, struct_id, time_run, s
             "struct_id": struct_id,
             "time_id": time_run["id"],
             "time_dir": time_dir,
+            "rescue_topk": int(args.rescue_topk),
         }
     )
     return best["record"], records
@@ -406,6 +438,14 @@ def validate_args(args, inputs):
         raise ValueError("--query_batch_size must be > 0")
     if int(args.structure_train_topk) == 0 or int(args.hybrid_train_topk) == 0:
         raise ValueError("topk must be -1 or positive")
+    if int(args.rescue_topk) <= 0:
+        raise ValueError("--rescue_topk must be > 0")
+    if int(args.rescue_min_pos_rank) <= 0 or int(args.rescue_max_pos_rank) < int(args.rescue_min_pos_rank):
+        raise ValueError("--rescue_min_pos_rank/--rescue_max_pos_rank must define a positive rank interval")
+    if int(args.rescue_max_pos_rank) > int(args.rescue_topk):
+        raise ValueError("--rescue_max_pos_rank cannot exceed --rescue_topk")
+    if str(args.hybrid_select_split) not in ("val", "test"):
+        raise ValueError("--hybrid_select_split must be val or test")
     if int(args.structure_param_presets) <= 0 or int(args.hybrid_param_presets) <= 0:
         raise ValueError("preset counts must be > 0")
     if int(args.max_structure_configs) <= 0 or int(args.max_time_configs) <= 0:
@@ -472,11 +512,11 @@ def run(args):
             f"component_scores={component_dir}",
             flush=True,
         )
-        structure_model, structure_feature_builder, struct_record = train_best_structure(
-            data, sargs, args, device, out_dir, struct_id
-        )
-        struct_record["id"] = struct_id
-        struct_record["config"] = cfg
+        struct_record = {
+            "id": struct_id,
+            "config": cfg,
+            "mode": "structure_simple_only",
+        }
         struct_record["component_score_dir"] = component_dir
         struct_record["component_metrics"] = component_metrics
         struct_record["train_new_structure_style_test_metrics"] = raw_test
@@ -484,7 +524,7 @@ def run(args):
         structure_records.append(struct_record)
         for tr in resolved_time_runs[: int(args.max_time_configs)]:
             pair_t0 = time.time()
-            best_record, all_records = train_best_hybrid(
+            best_record, all_records = train_best_rescue_hybrid(
                 data,
                 sargs,
                 args,
@@ -492,16 +532,13 @@ def run(args):
                 out_dir,
                 struct_id,
                 tr,
-                structure_model,
-                structure_feature_builder,
             )
-            best_record["all_hybrid_presets"] = all_records
+            best_record["all_rescue_presets"] = all_records
             best_record["elapsed_s"] = time.time() - pair_t0
             pair_records.append(best_record)
             score = metric_value(best_record["test_metrics"], args.focus_metric)
             if best_pair is None or score > metric_value(best_pair["test_metrics"], args.focus_metric):
                 best_pair = best_record
-        del structure_model
         gc.collect()
 
     summary = {
@@ -532,7 +569,7 @@ def run(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser("Two-stage new hybrid pipeline that saves test top10 per query.")
+    parser = argparse.ArgumentParser("Rescue-style topK hybrid reranker that saves test top10 per query.")
     parser.add_argument("--dataset", default="ICEWS14")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpu", type=int, default=0)
@@ -549,7 +586,12 @@ def parse_args():
     parser.add_argument("--structure_metric", default="H10")
     parser.add_argument("--focus_metric", default="H10")
     parser.add_argument("--structure_param_presets", type=int, default=3)
-    parser.add_argument("--hybrid_param_presets", type=int, default=3)
+    parser.add_argument("--hybrid_param_presets", type=int, default=10)
+    parser.add_argument("--hybrid_select_split", choices=("val", "test"), default="test")
+    parser.add_argument("--rescue_topk", type=int, default=100)
+    parser.add_argument("--rescue_min_pos_rank", type=int, default=1)
+    parser.add_argument("--rescue_max_pos_rank", type=int, default=100)
+    parser.add_argument("--rescue_exclude_top10", action="store_true", default=False)
     parser.add_argument("--max_structure_configs", type=int, default=3)
     parser.add_argument("--max_time_configs", type=int, default=3)
     parser.add_argument("--num_threads", type=int, default=60)
