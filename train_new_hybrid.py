@@ -30,7 +30,7 @@ from utils import (
 
 EPS = 1e-12
 FIT_PROTOCOL = "new_hybrid_optuna_v1"
-EXPECTED_STRUCTURE_IMPL = "new_structure_v2"
+EXPECTED_STRUCTURE_IMPL = "new_structure_v3"
 DEFAULT_HYBRID_CONFIG = osp.join("configs", "new_hybrid_inputs.json")
 
 
@@ -967,7 +967,7 @@ def require_score_dir(out_dir, label):
         raise FileNotFoundError(f"{label} score files are incomplete under {out_dir}:\n  {text}{extra}")
 
 
-def require_train_new_structure_v2():
+def require_train_new_structure_impl():
     impl = getattr(train_new_structure, "NEW_STRUCTURE_IMPL", None)
     if impl is not None:
         if impl != EXPECTED_STRUCTURE_IMPL:
@@ -1127,7 +1127,7 @@ def make_structure_args(args, cfg):
 
 
 def prepare_structure_runs(args, inputs):
-    require_train_new_structure_v2()
+    require_train_new_structure_impl()
     runs = []
     for cfg in structure_configs_from_config(inputs, args.dataset):
         sargs = make_structure_args(args, cfg)

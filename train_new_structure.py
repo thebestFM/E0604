@@ -39,7 +39,10 @@ from utils import (
 )
 
 
-NEW_STRUCTURE_IMPL = 'new_structure_v2'
+NEW_STRUCTURE_IMPL = 'new_structure_v3'
+DSH_GLOBAL_LAZY_SAFE_EXP = 650.0
+DSH_BUCKET_CLEAR_EXP = 700.0
+DSH_BUCKET_MATERIALIZE_SCALE = 1e-100
 
 
 class LogicMatrixUpdater:
@@ -292,15 +295,26 @@ def _score_dsh_candidates(keys, values, rows, pos_obj, neg_samples, pos_out, neg
 
 
 class DirectSingleHopScorer:
-    def __init__(self, num_rels, decay_direct=1.0):
+    def __init__(self, num_rels, decay_direct=1.0, max_time_span=None):
         self.num_rels = int(num_rels)
         self.decay_direct = float(decay_direct)
         self.rel_shift = 10 ** int(math.ceil(math.log10(self.num_rels + 1)))
         self.V_sr = {}
         self.V_sr_sum = {}
         self.time_shift = 0.0
+        self.bucket_last_ts = {}
+        self.bucket_scale = {}
         self._sr_version = {}
         self._array_cache = {}
+        self.max_time_span = None if max_time_span is None else float(max_time_span)
+        max_exp = 0.0 if self.max_time_span is None else self.decay_direct * max(0.0, self.max_time_span)
+        self.decay_mode = 'bucket_lazy' if max_exp > DSH_GLOBAL_LAZY_SAFE_EXP else 'global_lazy'
+        print(
+            f'[DSH] mode={self.decay_mode} decay_direct={self.decay_direct:g} '
+            f'max_time_span={"unknown" if self.max_time_span is None else f"{self.max_time_span:g}"} '
+            f'max_exp={"unknown" if self.max_time_span is None else f"{max_exp:g}"}',
+            flush=True,
+        )
 
     def _warn(self, where, message):
         print(f'[DSH-warning] {where}: {message}', flush=True)
@@ -308,8 +322,8 @@ class DirectSingleHopScorer:
     def _sr_key(self, s, r):
         return int(s) * self.rel_shift + int(r)
 
-    def _clear_sr(self, sr, where='', reason=''):
-        if where or reason:
+    def _clear_sr(self, sr, where='', reason='', warn=True):
+        if warn and (where or reason):
             size = len(self.V_sr.get(sr, {}))
             total = self.V_sr_sum.get(sr, None)
             self._warn(
@@ -319,6 +333,8 @@ class DirectSingleHopScorer:
             )
         self.V_sr.pop(sr, None)
         self.V_sr_sum.pop(sr, None)
+        self.bucket_last_ts.pop(sr, None)
+        self.bucket_scale.pop(sr, None)
         self._mark_dirty(sr)
 
     def _clear_all(self, where='', reason=''):
@@ -330,6 +346,8 @@ class DirectSingleHopScorer:
             )
         self.V_sr.clear()
         self.V_sr_sum.clear()
+        self.bucket_last_ts.clear()
+        self.bucket_scale.clear()
         self._array_cache.clear()
         self._sr_version.clear()
 
@@ -372,7 +390,7 @@ class DirectSingleHopScorer:
         self._array_cache[sr] = (version, keys, values)
         return keys, values
 
-    def update_state(self, events, ts):
+    def _update_state_global_lazy(self, events_i64, ts):
         rel_exp = self.decay_direct * (float(ts) - self.time_shift)
         if not math.isfinite(rel_exp):
             self._clear_all(where='update_state', reason=f'non-finite decay exponent rel_exp={rel_exp}, ts={ts}, time_shift={self.time_shift}')
@@ -420,7 +438,7 @@ class DirectSingleHopScorer:
             raise RuntimeError(f'DSH produced invalid update weight: ts={ts}, rel_exp={rel_exp}, weight={weight}')
 
         dirty = set()
-        for s, r, o in events[:, :3].astype(np.int64, copy=False):
+        for s, r, o in events_i64:
             sr = self._sr_key(s, r)
             existing_sum = float(self.V_sr_sum.get(sr, 0.0))
             bucket = self.V_sr.get(sr)
@@ -446,6 +464,188 @@ class DirectSingleHopScorer:
             dirty.add(sr)
         for sr in dirty:
             self._mark_dirty(sr)
+
+    def _materialize_bucket_scale(self, sr, scale, ts, stats, reason):
+        bucket = self.V_sr.get(sr)
+        if not bucket:
+            self.bucket_scale[sr] = 1.0
+            self.bucket_last_ts[sr] = float(ts)
+            return 1.0
+        old_sum = float(self.V_sr_sum.get(sr, 0.0))
+        new_sum = old_sum * scale if math.isfinite(old_sum) else 0.0
+        if new_sum <= 0.0 or not math.isfinite(new_sum):
+            size = len(bucket)
+            self._clear_sr(sr, warn=False)
+            self.bucket_last_ts[sr] = float(ts)
+            self.bucket_scale[sr] = 1.0
+            stats['cleared_buckets'] += 1
+            stats['cleared_entries'] += size
+            stats['reason'] = f'{reason}: materialized total invalid'
+            return 1.0
+
+        empty = []
+        for obj in list(bucket.keys()):
+            old_value = float(bucket[obj])
+            new_value = old_value * scale if math.isfinite(old_value) else 0.0
+            if new_value < 0.0 or not math.isfinite(new_value):
+                size = len(bucket)
+                self._clear_sr(sr, warn=False)
+                self.bucket_last_ts[sr] = float(ts)
+                self.bucket_scale[sr] = 1.0
+                stats['cleared_buckets'] += 1
+                stats['cleared_entries'] += size
+                stats['reason'] = f'{reason}: materialized value invalid'
+                return 1.0
+            if new_value == 0.0:
+                empty.append(obj)
+            else:
+                bucket[obj] = new_value
+        for obj in empty:
+            del bucket[obj]
+        if not bucket:
+            self._clear_sr(sr, warn=False)
+            self.bucket_last_ts[sr] = float(ts)
+            self.bucket_scale[sr] = 1.0
+            stats['cleared_buckets'] += 1
+            stats['reason'] = f'{reason}: materialized bucket emptied'
+            return 1.0
+
+        self.V_sr_sum[sr] = new_sum
+        self.bucket_scale[sr] = 1.0
+        self.bucket_last_ts[sr] = float(ts)
+        return 1.0
+
+    def _advance_bucket_scale_to(self, sr, ts, stats):
+        ts = float(ts)
+        last_ts = self.bucket_last_ts.get(sr)
+        if last_ts is None:
+            self.bucket_last_ts[sr] = ts
+            self.bucket_scale[sr] = 1.0
+            return 1.0
+        dt = ts - float(last_ts)
+        if dt == 0.0:
+            return float(self.bucket_scale.get(sr, 1.0))
+        if dt < 0.0:
+            raise RuntimeError(f'DSH bucket received decreasing timestamp: sr={sr}, last_ts={last_ts}, ts={ts}')
+        rel_exp = self.decay_direct * dt
+        if rel_exp <= 0.0:
+            self.bucket_last_ts[sr] = ts
+            return float(self.bucket_scale.get(sr, 1.0))
+        if not math.isfinite(rel_exp):
+            size = len(self.V_sr.get(sr, {}))
+            self._clear_sr(sr, warn=False)
+            self.bucket_last_ts[sr] = ts
+            self.bucket_scale[sr] = 1.0
+            stats['cleared_buckets'] += 1
+            stats['cleared_entries'] += size
+            stats['reason'] = 'non-finite bucket decay exponent'
+            stats['max_rel_exp'] = float('inf')
+            return 1.0
+        if rel_exp >= DSH_BUCKET_CLEAR_EXP:
+            size = len(self.V_sr.get(sr, {}))
+            self._clear_sr(sr, warn=False)
+            self.bucket_last_ts[sr] = ts
+            self.bucket_scale[sr] = 1.0
+            stats['cleared_buckets'] += 1
+            stats['cleared_entries'] += size
+            stats['reason'] = 'bucket stale beyond clear threshold'
+            stats['max_rel_exp'] = max(stats['max_rel_exp'], float(rel_exp))
+            return 1.0
+
+        old_scale = float(self.bucket_scale.get(sr, 1.0))
+        step_scale = 2.0 ** (-rel_exp)
+        scale = old_scale * step_scale if math.isfinite(old_scale) else 0.0
+        if scale <= 0.0 or not math.isfinite(scale):
+            size = len(self.V_sr.get(sr, {}))
+            self._clear_sr(sr, warn=False)
+            self.bucket_last_ts[sr] = ts
+            self.bucket_scale[sr] = 1.0
+            stats['cleared_buckets'] += 1
+            stats['cleared_entries'] += size
+            stats['reason'] = 'bucket lazy scale became invalid'
+            stats['max_rel_exp'] = max(stats['max_rel_exp'], float(rel_exp))
+            return 1.0
+        stats['max_rel_exp'] = max(stats['max_rel_exp'], float(rel_exp))
+        if scale < DSH_BUCKET_MATERIALIZE_SCALE:
+            return self._materialize_bucket_scale(sr, scale, ts, stats, 'bucket lazy scale too small')
+        self.bucket_scale[sr] = scale
+        self.bucket_last_ts[sr] = ts
+        return scale
+
+    def _update_state_bucket_lazy(self, events_i64, ts):
+        grouped = defaultdict(dict)
+        for s, r, o in events_i64:
+            sr = self._sr_key(s, r)
+            obj = int(o)
+            counts = grouped[sr]
+            counts[obj] = counts.get(obj, 0) + 1
+
+        dirty = set()
+        stats = {'cleared_buckets': 0, 'cleared_entries': 0, 'max_rel_exp': 0.0, 'reason': ''}
+        for sr, counts in grouped.items():
+            scale = self._advance_bucket_scale_to(sr, ts, stats)
+            existing_sum = float(self.V_sr_sum.get(sr, 0.0))
+            bucket = self.V_sr.get(sr)
+            if bucket is not None and (existing_sum <= 0.0 or not math.isfinite(existing_sum)):
+                self._clear_sr(sr, where='update_state', reason=f'existing bucket total invalid before update: total={existing_sum}')
+                scale = 1.0
+            bucket = self.V_sr.setdefault(sr, {})
+            self.bucket_last_ts[sr] = float(ts)
+            self.bucket_scale[sr] = float(scale)
+
+            add_sum = 0.0
+            for obj, count in counts.items():
+                old_value = float(bucket.get(obj, 0.0))
+                if old_value < 0.0 or not math.isfinite(old_value):
+                    self._clear_sr(sr, where='update_state', reason=f'existing bucket value invalid before update: object={obj}, value={old_value}')
+                    bucket = self.V_sr.setdefault(sr, {})
+                    self.bucket_last_ts[sr] = float(ts)
+                    self.bucket_scale[sr] = 1.0
+                    scale = 1.0
+                    old_value = 0.0
+                inc = float(count) / float(scale)
+                new_value = old_value + inc
+                if new_value < 0.0 or not math.isfinite(new_value):
+                    self._clear_sr(sr, where='update_state', reason=f'update would create invalid value: object={obj}, new_value={new_value}, inc={inc}')
+                    bucket = self.V_sr.setdefault(sr, {})
+                    self.bucket_last_ts[sr] = float(ts)
+                    self.bucket_scale[sr] = 1.0
+                    scale = 1.0
+                    inc = float(count)
+                    new_value = inc
+                bucket[obj] = new_value
+                add_sum += inc
+
+            new_sum = float(self.V_sr_sum.get(sr, 0.0)) + add_sum
+            if new_sum <= 0.0 or not math.isfinite(new_sum):
+                self._clear_sr(sr, where='update_state', reason=f'update would create invalid total: new_sum={new_sum}, add_sum={add_sum}')
+                bucket = self.V_sr.setdefault(sr, {})
+                bucket.clear()
+                for obj, count in counts.items():
+                    bucket[obj] = float(count)
+                self.V_sr_sum[sr] = float(sum(counts.values()))
+                self.bucket_last_ts[sr] = float(ts)
+                self.bucket_scale[sr] = 1.0
+            else:
+                self.V_sr_sum[sr] = new_sum
+            dirty.add(sr)
+
+        for sr in dirty:
+            self._mark_dirty(sr)
+        if stats['cleared_buckets']:
+            print(
+                f'[DSH-info] bucket_lazy update_state: cleared stale/invalid buckets={stats["cleared_buckets"]} '
+                f'entries={stats["cleared_entries"]} max_rel_exp={stats["max_rel_exp"]:.3g} '
+                f'reason={stats["reason"]} ts={float(ts):g}',
+                flush=True,
+            )
+
+    def update_state(self, events, ts):
+        events_i64 = events[:, :3].astype(np.int64, copy=False)
+        if self.decay_mode == 'bucket_lazy':
+            self._update_state_bucket_lazy(events_i64, ts)
+        else:
+            self._update_state_global_lazy(events_i64, ts)
 
     def predict_batch(self, batch_data, neg_samples):
         batch_size, width = neg_samples.shape
@@ -3330,6 +3530,14 @@ def load_structure_data(args):
     )
 
 
+def estimate_max_t_norm(data):
+    max_t = 0.0
+    for split_name in ('train_list', 'val_list', 'test_list'):
+        for _, t_norm, _ in data.get(split_name, []):
+            max_t = max(max_t, float(t_norm))
+    return max_t
+
+
 def validate_args(args):
     if args.dataset not in SUPPORTED_DATASETS:
         raise ValueError(f'unsupported dataset: {args.dataset}')
@@ -3480,7 +3688,14 @@ def main(args):
         flush=True,
     )
     predictor, semantic_updater, logic_updater = build_runtime(args, data['num_nodes'], data['num_rels'], device)
-    direct_scorer = DirectSingleHopScorer(num_rels=data['num_rels'], decay_direct=args.decay_direct)
+    max_t_norm = estimate_max_t_norm(data)
+    direct_scorer = DirectSingleHopScorer(
+        num_rels=data['num_rels'],
+        decay_direct=args.decay_direct,
+        max_time_span=max_t_norm,
+    )
+    args.dsh_decay_mode = direct_scorer.decay_mode
+    args.dsh_max_time_span = max_t_norm
 
     train_metrics, val_metrics, test_metrics, runtime_stats = run_inference(
         predictor, direct_scorer, data, args, semantic_updater, logic_updater
