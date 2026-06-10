@@ -303,7 +303,7 @@ def require_time_scores(time_dir, label):
         raise FileNotFoundError(f"{label} missing time score files, first missing: {missing[0]}")
 
 
-def train_best_rescue_hybrid(data, sargs, args, device, out_dir, struct_id, time_run):
+def train_best_rescue_hybrid(data, sargs, args, device, out_dir, struct_id, time_run, component_dir):
     rescue_feature_builder = RescueHybridFeatureBuilder(data["num_rels"])
     time_dir = time_run["dir"]
     include_top10 = not bool(getattr(args, "rescue_exclude_top10", False))
@@ -321,6 +321,7 @@ def train_best_rescue_hybrid(data, sargs, args, device, out_dir, struct_id, time
         time_dir,
         device,
         int(args.rescue_topk),
+        component_root=component_dir,
         min_pos_rank=int(args.rescue_min_pos_rank),
         max_pos_rank=int(args.rescue_max_pos_rank),
         include_top10=include_top10,
@@ -354,6 +355,7 @@ def train_best_rescue_hybrid(data, sargs, args, device, out_dir, struct_id, time
             time_dir,
             device,
             int(args.rescue_topk),
+            component_root=component_dir,
         )
         score = metric_value(select_metrics, args.focus_metric)
         print(
@@ -393,6 +395,7 @@ def train_best_rescue_hybrid(data, sargs, args, device, out_dir, struct_id, time
         time_dir,
         device,
         int(args.rescue_topk),
+        component_root=component_dir,
         save_top10_path=top10_path,
     )
     print(
@@ -532,6 +535,7 @@ def run(args):
                 out_dir,
                 struct_id,
                 tr,
+                component_dir,
             )
             best_record["all_rescue_presets"] = all_records
             best_record["elapsed_s"] = time.time() - pair_t0

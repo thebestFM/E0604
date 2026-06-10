@@ -118,6 +118,64 @@ def dsh_grid(dataset):
         decays = [0.35, 0.50, 0.70, 0.85, 1.00, 1.15, 1.35, 1.60, 2.00, 2.50]
     elif dataset == "GDELT":
         decays = [0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20, 0.30, 0.50, 0.80]
+    elif dataset == "GDELT":
+        base = {
+            "dict_mode": "tag_sum",
+            "ppr_alpha": 0.012,
+            "ppr_beta": 0.93,
+            "gamma": 0.0,
+            "direct_single_hop": 1.0,
+            "decay_direct": 0.04,
+            "top_direct": -1,
+        }
+        rows = [
+            ("gdelt_s2_dsh_decay0.005", {"decay_direct": 0.005}),
+            ("gdelt_s2_dsh_decay0.010", {"decay_direct": 0.010}),
+            ("gdelt_s2_dsh_decay0.015", {"decay_direct": 0.015}),
+            ("gdelt_s2_dsh_decay0.020", {"decay_direct": 0.020}),
+            ("gdelt_s2_dsh_decay0.030", {"decay_direct": 0.030}),
+            ("gdelt_s2_dsh_decay0.040_replay", {}),
+            ("gdelt_s2_dsh_decay0.050", {"decay_direct": 0.050}),
+            ("gdelt_s2_dsh_decay0.035", {"decay_direct": 0.035}),
+            ("gdelt_s2_dsh_decay0.025", {"decay_direct": 0.025}),
+            ("gdelt_s2_mix_w0.98_decay0.020", {
+                "direct_single_hop": 0.98,
+                "decay_direct": 0.020,
+                "ppr_alpha": 0.012,
+                "ppr_beta": 0.95,
+            }),
+            ("gdelt_s2_mix_w0.95_decay0.020", {
+                "direct_single_hop": 0.95,
+                "decay_direct": 0.020,
+                "ppr_alpha": 0.012,
+                "ppr_beta": 0.95,
+            }),
+            ("gdelt_s2_mix_w0.90_decay0.020", {
+                "direct_single_hop": 0.90,
+                "decay_direct": 0.020,
+                "ppr_alpha": 0.012,
+                "ppr_beta": 0.95,
+            }),
+            ("gdelt_s2_mix_w0.98_decay0.010", {
+                "direct_single_hop": 0.98,
+                "decay_direct": 0.010,
+                "ppr_alpha": 0.012,
+                "ppr_beta": 0.95,
+            }),
+            ("gdelt_s2_mix_w0.95_decay0.010", {
+                "direct_single_hop": 0.95,
+                "decay_direct": 0.010,
+                "ppr_alpha": 0.012,
+                "ppr_beta": 0.95,
+            }),
+            ("gdelt_s2_gamma0.001_w0.98", {
+                "direct_single_hop": 0.98,
+                "decay_direct": 0.020,
+                "ppr_alpha": 0.012,
+                "ppr_beta": 0.95,
+                "gamma": 0.001,
+            }),
+        ]
     elif dataset == "tkgl-polecat":
         decays = [0.001, 0.002, 0.005, 0.008, 0.010, 0.020, 0.050, 0.100, 0.200, 0.500]
     elif dataset == "tkgl-icews":
@@ -279,7 +337,7 @@ def stage2_grid(dataset):
             }),
         ]
     else:
-        raise ValueError("--stage stage2 currently supports only ICEWS14 and tkgl-polecat")
+        raise ValueError("--stage stage2 currently supports ICEWS14, GDELT, and tkgl-polecat")
 
     configs = []
     for label, overrides in rows:

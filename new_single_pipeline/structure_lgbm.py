@@ -361,6 +361,24 @@ def init_stream_state(data, split, args, device):
     return runtime, timeline, history
 
 
+def init_timeline_history_state(data, split, args):
+    timeline = BTimeline(data["num_rels"], data["num_nodes"])
+    history = CausalHistory(data["num_nodes"], data["num_rels"])
+    warmup = []
+    if split == "train":
+        warmup = [(snap, True) for snap in data["train_list"][: data["train_predict_start_idx"]]]
+    elif split == "val":
+        warmup = [(snap, True) for snap in data["train_list"]]
+    elif split == "test":
+        warmup = [(snap, True) for snap in data["train_list"]]
+        warmup.extend((snap, False) for snap in data["val_list"])
+    for (events, _, _), is_train_update in warmup:
+        update_events = events_for_update(events, data, args, is_train=is_train_update)
+        timeline.update(update_events)
+        history.update(update_events)
+    return timeline, history
+
+
 def component_score_dict(parts, b_pos, b_neg, valid):
     scores = {}
     for name, (pos, neg) in parts.items():
@@ -1155,6 +1173,83 @@ def iter_rescue_hybrid_blocks(data, split, args, rescue_feature_builder, time_di
         raise RuntimeError(f"time row count mismatch for split={split}: stream={row_offset}, store={time_store.num_rows}")
 
 
+def iter_saved_rescue_hybrid_blocks(data, split, args, rescue_feature_builder, component_root, time_dir):
+    time_store = ScoreStore(time_dir, split)
+    component_stores = {
+        name: ScoreStore(osp.join(component_root, split, name), split)
+        for name in COMPONENT_SCORE_NAMES
+    }
+    expected_rows = next(iter(component_stores.values())).num_rows
+    for name, store in component_stores.items():
+        if store.num_rows != expected_rows:
+            raise RuntimeError(f"component row mismatch for {split}/{name}: {store.num_rows} != {expected_rows}")
+    if time_store.num_rows != expected_rows:
+        raise RuntimeError(f"time/component row mismatch for {split}: time={time_store.num_rows}, component={expected_rows}")
+
+    timeline, history = init_timeline_history_state(data, split, args)
+    neg_sampler = data["negative_sampler"]
+    row_offset = 0
+    for events, t_norm, t_orig in split_snapshots(data, split):
+        for batch_data, neg_arr, neg_mask in collect_eval_batch(events, t_orig, neg_sampler, split, args.query_batch_size):
+            width = int(neg_arr.shape[1])
+            end = row_offset + len(batch_data)
+            scores = {}
+            valid = np.concatenate((np.ones((len(batch_data), 1), dtype=bool), neg_mask[:, :width]), axis=1)
+            for name, store in component_stores.items():
+                pos, neg, mask = store.get_block(row_offset, end, width)
+                valid[:, 1:] &= mask
+                scores[name] = np.concatenate((pos, neg), axis=1).astype(np.float32, copy=False)
+            time_pos, time_neg, time_mask = time_store.get_block(row_offset, end, width)
+            valid[:, 1:] &= time_mask
+            time_scores = np.concatenate((time_pos, time_neg), axis=1).astype(np.float32, copy=False)
+            time_scores = np.where(valid, time_scores, 0.0).astype(np.float32, copy=False)
+
+            rels, pos_counts, neg_counts = timeline.count_batch(batch_data, neg_arr, width)
+            cand_ids = np.concatenate((batch_data[:, 2:3], neg_arr[:, :width]), axis=1)
+            cand_ids = np.where(valid, cand_ids, -1).astype(np.int64, copy=False)
+            b_counts = np.concatenate((pos_counts.reshape(-1, 1), neg_counts), axis=1).astype(np.float32, copy=False)
+            history_values = history.features(
+                batch_data[:, 0].astype(np.int64, copy=False),
+                batch_data[:, 1].astype(np.int64, copy=False),
+                cand_ids,
+                b_counts,
+            )
+            features = rescue_feature_builder.make(
+                scores,
+                time_scores,
+                valid,
+                batch_data,
+                cand_ids,
+                b_counts=b_counts,
+                history_values=history_values,
+            )
+            yield SimpleNamespace(
+                batch_data=batch_data,
+                valid=valid,
+                scores=scores,
+                time_scores=time_scores,
+                cand_ids=cand_ids,
+                features=features,
+                t_norm=t_norm,
+                t_orig=t_orig,
+            )
+            row_offset = end
+
+        update_events = events_for_update(events, data, args, is_train=(split == "train"))
+        timeline.update(update_events)
+        history.update(update_events)
+
+    if row_offset != expected_rows:
+        raise RuntimeError(f"component row count mismatch for split={split}: stream={row_offset}, stores={expected_rows}")
+
+
+def iter_rescue_blocks(data, split, args, rescue_feature_builder, time_dir, device, component_root=None):
+    if component_root:
+        yield from iter_saved_rescue_hybrid_blocks(data, split, args, rescue_feature_builder, component_root, time_dir)
+    else:
+        yield from iter_rescue_hybrid_blocks(data, split, args, rescue_feature_builder, time_dir, device)
+
+
 def rescue_topk_mask(structure_scores, valid, topk):
     ranks = dense_rank(structure_scores, valid)
     return (ranks <= int(topk)) & valid, ranks
@@ -1168,6 +1263,7 @@ def build_rescue_hybrid_matrix(
     time_dir,
     device,
     topk,
+    component_root=None,
     min_pos_rank=1,
     max_pos_rank=100,
     include_top10=True,
@@ -1180,7 +1276,7 @@ def build_rescue_hybrid_matrix(
     skipped_pos_after_topk = 0
     preserve_queries = 0
     rescue_queries = 0
-    for block in iter_rescue_hybrid_blocks(data, split, args, rescue_feature_builder, time_dir, device):
+    for block in iter_rescue_blocks(data, split, args, rescue_feature_builder, time_dir, device, component_root):
         selected, ranks = rescue_topk_mask(block.scores["structure_raw"], block.valid, topk)
         pos_ranks = ranks[:, 0]
         for row in range(selected.shape[0]):
@@ -1259,6 +1355,7 @@ def evaluate_rescue_hybrid_model(
     time_dir,
     device,
     topk,
+    component_root=None,
     save_top10_path=None,
 ):
     sums = {}
@@ -1276,7 +1373,7 @@ def evaluate_rescue_hybrid_model(
         top10_f = open(save_top10_path, "w", encoding="utf-8")
     query_idx = 0
     try:
-        for block in iter_rescue_hybrid_blocks(data, split, args, rescue_feature_builder, time_dir, device):
+        for block in iter_rescue_blocks(data, split, args, rescue_feature_builder, time_dir, device, component_root):
             selected, ranks = rescue_topk_mask(block.scores["structure_raw"], block.valid, topk)
             loose = []
             strict = []
