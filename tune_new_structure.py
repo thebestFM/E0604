@@ -207,6 +207,89 @@ def shared_variants(dataset, base_cfg):
     return variants
 
 
+def stage2_grid(dataset):
+    if dataset == "ICEWS14":
+        base = {
+            "dict_mode": "tag_sum",
+            "ppr_alpha": 0.030,
+            "ppr_beta": 0.960,
+            "gamma": 0.003,
+            "direct_single_hop": 0.85,
+            "decay_direct": 0.35,
+            "top_direct": -1,
+        }
+        rows = [
+            ("icews14_s2_best_replay", {}),
+            ("icews14_s2_decay0.30", {"decay_direct": 0.30}),
+            ("icews14_s2_decay0.25", {"decay_direct": 0.25}),
+            ("icews14_s2_decay0.20", {"decay_direct": 0.20}),
+            ("icews14_s2_decay0.40", {"decay_direct": 0.40}),
+            ("icews14_s2_w0.80", {"direct_single_hop": 0.80}),
+            ("icews14_s2_w0.88", {"direct_single_hop": 0.88}),
+            ("icews14_s2_w0.92", {"direct_single_hop": 0.92}),
+            ("icews14_s2_decay0.30_w0.80", {"decay_direct": 0.30, "direct_single_hop": 0.80}),
+            ("icews14_s2_decay0.30_w0.90", {"decay_direct": 0.30, "direct_single_hop": 0.90}),
+            ("icews14_s2_a0.035_b0.965", {"ppr_alpha": 0.035, "ppr_beta": 0.965}),
+            ("icews14_s2_a0.040_b0.970", {"ppr_alpha": 0.040, "ppr_beta": 0.970}),
+            ("icews14_s2_a0.025_b0.955", {"ppr_alpha": 0.025, "ppr_beta": 0.955}),
+            ("icews14_s2_a0.030_b0.965", {"ppr_beta": 0.965}),
+            ("icews14_s2_a0.035_b0.960", {"ppr_alpha": 0.035}),
+            ("icews14_s2_gamma0", {"gamma": 0.0}),
+            ("icews14_s2_gamma0.001", {"gamma": 0.001}),
+            ("icews14_s2_gamma0.006", {"gamma": 0.006}),
+            ("icews14_s2_gamma0.010", {"gamma": 0.010}),
+            ("icews14_s2_w0.65", {"direct_single_hop": 0.65}),
+            ("icews14_s2_w0.75", {"direct_single_hop": 0.75}),
+        ]
+    elif dataset == "tkgl-polecat":
+        base = {
+            "dict_mode": "tag_sum",
+            "ppr_alpha": 0.025,
+            "ppr_beta": 0.945,
+            "gamma": 0.0,
+            "direct_single_hop": 0.15,
+            "decay_direct": 0.002,
+            "top_direct": -1,
+        }
+        rows = [
+            ("polecat_s2_best_replay", {}),
+            ("polecat_s2_decay0.0015", {"decay_direct": 0.0015}),
+            ("polecat_s2_decay0.003", {"decay_direct": 0.003}),
+            ("polecat_s2_decay0.004", {"decay_direct": 0.004}),
+            ("polecat_s2_decay0.005", {"decay_direct": 0.005}),
+            ("polecat_s2_w0.10", {"direct_single_hop": 0.10}),
+            ("polecat_s2_w0.12", {"direct_single_hop": 0.12}),
+            ("polecat_s2_w0.18", {"direct_single_hop": 0.18}),
+            ("polecat_s2_w0.20", {"direct_single_hop": 0.20}),
+            ("polecat_s2_a0.0225_b0.942", {"ppr_alpha": 0.0225, "ppr_beta": 0.942}),
+            ("polecat_s2_a0.0275_b0.947", {"ppr_alpha": 0.0275, "ppr_beta": 0.947}),
+            ("polecat_s2_a0.030_b0.950", {"ppr_alpha": 0.030, "ppr_beta": 0.950}),
+            ("polecat_s2_a0.035_b0.955", {"ppr_alpha": 0.035, "ppr_beta": 0.955}),
+            ("polecat_s2_b0.950", {"ppr_beta": 0.950}),
+            ("polecat_s2_gamma0.0005_top500", {"gamma": 0.0005, "top_direct": 500}),
+            ("polecat_s2_gamma0.001_top500", {"gamma": 0.001, "top_direct": 500}),
+            ("polecat_s2_gamma0.002_top500", {"gamma": 0.002, "top_direct": 500}),
+            ("polecat_s2_gamma0.003_top500", {"gamma": 0.003, "top_direct": 500}),
+            ("polecat_s2_gamma0.001_full_direct", {"gamma": 0.001, "top_direct": -1}),
+            ("polecat_s2_w0.12_decay0.003_a0.0275", {
+                "direct_single_hop": 0.12,
+                "decay_direct": 0.003,
+                "ppr_alpha": 0.0275,
+                "ppr_beta": 0.947,
+            }),
+        ]
+    else:
+        raise ValueError("--stage stage2 currently supports only ICEWS14 and tkgl-polecat")
+
+    configs = []
+    for label, overrides in rows:
+        cfg = copy.deepcopy(base)
+        cfg.update(overrides)
+        cfg["stage2_id"] = label
+        configs.append(cfg)
+    return configs
+
+
 def run_structure(args, stage, idx, overrides):
     cfg = structure_arg_dict(args, overrides)
     sargs = SimpleNamespace(**cfg)
@@ -267,11 +350,14 @@ def record_line(record, focus):
 
 
 def output_dir(args):
+    suffix = f"metric={args.focus_test_metric}_nsq={DATASET_DEFAULTS[args.dataset]['ns_q']}_nsseed={args.ns_seed}"
+    if getattr(args, "stage", "stage1") != "stage1":
+        suffix = f"{suffix}_{args.stage}"
     return osp.join(
         args.output_root,
         args.dataset,
         f"seed{args.seed}",
-        f"metric={args.focus_test_metric}_nsq={DATASET_DEFAULTS[args.dataset]['ns_q']}_nsseed={args.ns_seed}",
+        suffix,
     )
 
 
@@ -285,6 +371,8 @@ def save_summary(out_dir, payload):
 def main(args):
     if args.dataset not in DATASET_DEFAULTS:
         raise ValueError(f"--dataset must be one of {sorted(DATASET_DEFAULTS)}")
+    if getattr(args, "stage", "stage1") == "stage2":
+        return main_stage2(args)
     focus = args.focus_test_metric
     out_dir = output_dir(args)
     summary = {
@@ -381,8 +469,38 @@ def main(args):
     return summary
 
 
+def main_stage2(args):
+    focus = args.focus_test_metric
+    out_dir = output_dir(args)
+    summary = {
+        "format": "new_structure_tuning_stage2_v1",
+        "args": vars(args).copy(),
+        "dataset_defaults": DATASET_DEFAULTS[args.dataset],
+        "stage2": [],
+    }
+    save_summary(out_dir, summary)
+
+    print(f"[TuneStructure] output -> {out_dir}", flush=True)
+    print("[TuneStructure] stage 2: focused full-structure combinations", flush=True)
+    for idx, cfg in enumerate(stage2_grid(args.dataset), start=1):
+        stage2_id = cfg.pop("stage2_id")
+        rec = run_structure(args, "stage2_full", idx, cfg)
+        rec["stage2_id"] = stage2_id
+        summary["stage2"].append(rec)
+        print(f"[TuneStructure] {stage2_id} " + record_line(rec, focus), flush=True)
+        save_summary(out_dir, summary)
+
+    summary["best"] = sort_top(summary["stage2"], focus, 1)[0]
+    save_summary(out_dir, summary)
+    best = summary["best"]
+    print("[TuneStructure] best stage2: " + record_line(best, focus), flush=True)
+    print(f"[TuneStructure] summary saved: {osp.join(out_dir, 'summary.json')}", flush=True)
+    return summary
+
+
 def parse_args():
     parser = argparse.ArgumentParser("Tune train_new_structure.py with hard-coded promising grids.")
+    parser.add_argument("--stage", choices=("stage1", "stage2"), default="stage1")
     parser.add_argument("--dataset", choices=sorted(DATASET_DEFAULTS), default="ICEWS14")
     parser.add_argument("--focus_test_metric", choices=sorted(METRIC_KEYS), default="MRR")
     parser.add_argument("--seed", type=int, default=42)
