@@ -26,10 +26,12 @@ from new_single_pipeline.structure_lgbm import (
     save_component_score_stores,
     save_lgbm_model,
 )
+import train_new_structure as tns
 from utils import describe_loaded_data, load_datasets, ranking_metric_key, save_config, save_metrics, select_torch_device, set_random_seed
 
 
-PROTOCOL = "new_hybrid_save_top10_two_stage_v1"
+PROTOCOL = "new_hybrid_save_top10_two_stage_v2"
+REQUIRED_STRUCTURE_IMPL = "new_structure_v3"
 DEFAULT_CONFIG = osp.join("configs", "new_hybrid_inputs.json")
 
 
@@ -192,11 +194,18 @@ def make_out_dir(args, inputs):
             "protocol": PROTOCOL,
             "dataset": args.dataset,
             "config_hash": inputs["_hash"],
+            "structure_impl": getattr(tns, "NEW_STRUCTURE_IMPL", ""),
             "seed": args.seed,
             "ns_seed": args.ns_seed,
             "train_predict_ratio": args.train_predict_ratio,
             "structure_topk": args.structure_train_topk,
             "hybrid_topk": args.hybrid_train_topk,
+            "structure_param_presets": args.structure_param_presets,
+            "hybrid_param_presets": args.hybrid_param_presets,
+            "max_structure_configs": args.max_structure_configs,
+            "max_time_configs": args.max_time_configs,
+            "structure_preset_hash": stable_hash(STRUCTURE_PARAM_PRESETS, length=10),
+            "hybrid_preset_hash": stable_hash(HYBRID_PARAM_PRESETS, length=10),
             "focus_metric": args.focus_metric,
             "b": {
                 "mode": args.b_mode,
@@ -375,6 +384,11 @@ def train_best_hybrid(data, sargs, args, device, out_dir, struct_id, time_run, s
 
 
 def validate_args(args, inputs):
+    if getattr(tns, "NEW_STRUCTURE_IMPL", None) != REQUIRED_STRUCTURE_IMPL:
+        raise RuntimeError(
+            f"train_new_hybrid_save_top10.py requires train_new_structure.py impl={REQUIRED_STRUCTURE_IMPL}; "
+            f"got {getattr(tns, 'NEW_STRUCTURE_IMPL', None)!r}"
+        )
     if args.dataset not in inputs["dataset_common"]:
         raise ValueError(f"dataset {args.dataset!r} is not present in {args.hybrid_config}")
     focus = str(args.focus_metric).upper().replace("@", "")
@@ -392,6 +406,16 @@ def validate_args(args, inputs):
         raise ValueError("--query_batch_size must be > 0")
     if int(args.structure_train_topk) == 0 or int(args.hybrid_train_topk) == 0:
         raise ValueError("topk must be -1 or positive")
+    if int(args.structure_param_presets) <= 0 or int(args.hybrid_param_presets) <= 0:
+        raise ValueError("preset counts must be > 0")
+    if int(args.max_structure_configs) <= 0 or int(args.max_time_configs) <= 0:
+        raise ValueError("max config counts must be > 0")
+    if int(args.num_threads) <= 0:
+        raise ValueError("--num_threads must be > 0")
+    if int(args.source_join_threads) < 0:
+        raise ValueError("--source_join_threads must be >= 0")
+    if str(args.b_mode) == "continuous" and float(args.b_continuous_alpha) < 0.0:
+        raise ValueError("--b_continuous_alpha must be >= 0")
 
 
 def run(args):

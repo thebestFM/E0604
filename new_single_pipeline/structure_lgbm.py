@@ -347,13 +347,14 @@ def init_stream_state(data, split, args, device):
     history = CausalHistory(data["num_nodes"], data["num_rels"])
     warmup = []
     if split == "train":
-        warmup = data["train_list"][: data["train_predict_start_idx"]]
+        warmup = [(snap, True) for snap in data["train_list"][: data["train_predict_start_idx"]]]
     elif split == "val":
-        warmup = data["train_list"]
+        warmup = [(snap, True) for snap in data["train_list"]]
     elif split == "test":
-        warmup = data["train_list"] + data["val_list"]
-    for events, t_norm, _ in warmup:
-        update_events = events_for_update(events, data, args, is_train=(split == "train"))
+        warmup = [(snap, True) for snap in data["train_list"]]
+        warmup.extend((snap, False) for snap in data["val_list"])
+    for (events, t_norm, _), is_train_update in warmup:
+        update_events = events_for_update(events, data, args, is_train=is_train_update)
         runtime.update(update_events, t_norm)
         timeline.update(update_events)
         history.update(update_events)
