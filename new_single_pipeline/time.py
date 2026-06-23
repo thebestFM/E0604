@@ -2811,7 +2811,7 @@ def train_model_phase(
 
 
 def get_run_params(args):
-    return {
+    params = {
         "data": "utils_v4_oof_qvsuffix_speed1",
         "metric": "strict_v2",
         "bs": args.batch_size,
