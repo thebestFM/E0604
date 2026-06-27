@@ -1,0 +1,69 @@
+{
+  "format": "new_hybrid_inputs_v1",
+  "description": "tkgl-icews hybrid inputs using completed fast no-retrain time scores and completed pure-DSH structure configs from logs_new_0610/tune_struct_0610_icews.log.",
+  "dataset_common": {
+    "tkgl-icews": {
+      "ns_q": 5000,
+      "batch_size": 4096
+    }
+  },
+  "structure_output_root": "results_new_hybrid_structure",
+  "structure_top_configs": {
+    "tkgl-icews": [
+      {
+        "id": "tkgl_icews_pure_dsh_r01_decay050",
+        "batch_size": 4096,
+        "max_events_in_single_batch": 60000,
+        "dict_mode": "tag_sum",
+        "shared_w": "dual_msim",
+        "per_rel_use_mtrans": false,
+        "ppr_k": 1000,
+        "top_k_relation": 0,
+        "ppr_alpha": 0.012,
+        "ppr_beta": 0.93,
+        "gamma": 0.0,
+        "direct_single_hop": 1.0,
+        "decay_direct": 0.5,
+        "top_share": 100,
+        "top_direct": -1,
+        "decay_rel_trans": 0.05,
+        "window_semantic_sim": 5.0,
+        "window_trans": 5.0,
+        "close_update_backward": false,
+        "logged_test_mrr": 0.45608,
+        "logged_test_hit10": 0.51282
+      },
+      {
+        "id": "tkgl_icews_pure_dsh_r02_decay080",
+        "batch_size": 4096,
+        "max_events_in_single_batch": 60000,
+        "dict_mode": "tag_sum",
+        "shared_w": "dual_msim",
+        "per_rel_use_mtrans": false,
+        "ppr_k": 1000,
+        "top_k_relation": 0,
+        "ppr_alpha": 0.012,
+        "ppr_beta": 0.93,
+        "gamma": 0.0,
+        "direct_single_hop": 1.0,
+        "decay_direct": 0.8,
+        "top_share": 100,
+        "top_direct": -1,
+        "decay_rel_trans": 0.05,
+        "window_semantic_sim": 5.0,
+        "window_trans": 5.0,
+        "close_update_backward": false,
+        "logged_test_mrr": 0.43630,
+        "logged_test_hit10": 0.48417
+      }
+    ]
+  },
+  "time_runs": {
+    "tkgl-icews": [
+      {
+        "id": "time_mrr_fast_no_retrain",
+        "dir": "results_time_tkg_single/tkgl-icews/seed42/r90b7969f7268_topk20_mw20_ed64_hd128_bs20000_ebs1000_neg2_samfast_nsq5000_nss42_tpr0.3_abs1r0_gateoff_rank1_lossmargin_no_retrain_on_train_prefix"
+      }
+    ]
+  }
+}
