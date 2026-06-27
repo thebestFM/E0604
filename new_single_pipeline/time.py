@@ -12,6 +12,8 @@ import json
 import math
 import os
 import os.path as osp
+import copy
+import shutil
 import time
 
 import numpy as np
@@ -1733,6 +1735,77 @@ def prefix_metrics(prefix, metrics):
     return out
 
 
+def unprefix_saved_metrics(saved, prefix):
+    head = f"{prefix}_"
+    metrics = {}
+    for key, value in saved.items():
+        if not key.startswith(head):
+            continue
+        name = key[len(head) :]
+        if isinstance(value, (int, float)):
+            metrics[name] = float(value)
+    if "mrr" not in metrics and f"{prefix}_mrr" in saved:
+        metrics["mrr"] = float(saved[f"{prefix}_mrr"])
+    if "hit10" not in metrics and f"{prefix}_hit10" in saved:
+        metrics["hit10"] = float(saved[f"{prefix}_hit10"])
+    return metrics
+
+
+def copy_score_store(src_dir, dst_dir, mode):
+    os.makedirs(dst_dir, exist_ok=True)
+    copied = []
+    for suffix in ("pos.npy", "neg.npz", "valid_lens.npy", "meta.json"):
+        src = osp.join(src_dir, f"{mode}_{suffix}")
+        dst = osp.join(dst_dir, f"{mode}_{suffix}")
+        if not osp.isfile(src):
+            raise FileNotFoundError(f"missing reusable {mode} score file: {src}")
+        shutil.copy2(src, dst)
+        copied.append(dst)
+    return copied
+
+
+def matching_no_retrain_dir(args):
+    nrt_args = copy.copy(args)
+    nrt_args.no_retrain_on_train_prefix = True
+    if hasattr(nrt_args, "output_dir"):
+        nrt_args.output_dir = ""
+    return get_out_dir(nrt_args)
+
+
+def load_reusable_no_retrain_full(args, required_modes=("val", "test")):
+    if getattr(args, "no_retrain_on_train_prefix", False):
+        return None
+    if not getattr(args, "reuse_no_retrain_full", True):
+        return None
+    src_dir = matching_no_retrain_dir(args)
+    if not is_run_complete(src_dir, modes=required_modes):
+        print(
+            f"[TimeTKG] reusable no-retrain full run not complete: {src_dir}",
+            flush=True,
+        )
+        return None
+    best_model_path = osp.join(src_dir, "best_model.pt")
+    if not osp.isfile(best_model_path):
+        print(
+            f"[TimeTKG] reusable no-retrain full run missing best_model.pt: {src_dir}",
+            flush=True,
+        )
+        return None
+    metrics = load_metrics(src_dir)
+    if metrics.get("score_protocol") != "train_full_model_prefix_history_valtest_full_train":
+        print(
+            f"[TimeTKG] reusable no-retrain run has unexpected protocol "
+            f"{metrics.get('score_protocol')!r}: {src_dir}",
+            flush=True,
+        )
+        return None
+    return {
+        "dir": src_dir,
+        "best_model_path": best_model_path,
+        "metrics": metrics,
+    }
+
+
 def get_eval_source_encoded(
     model,
     batch_data,
@@ -3018,6 +3091,8 @@ def print_epoch_profile(epoch, args, model, train_profile, val_profile, device, 
 
 
 def validate_args(args):
+    if not hasattr(args, "reuse_no_retrain_full"):
+        args.reuse_no_retrain_full = True
     if args.ns_q == 0 or args.ns_q < -1:
         raise ValueError("--ns_q must be -1 or a positive integer")
     if not 0.0 <= float(args.train_predict_ratio) < 1.0:
@@ -3141,25 +3216,60 @@ def main(args):
     dst_pool = get_destination_pool(data, num_nodes)
     selection_metric = getattr(args, "selection_metric", "mrr")
     best_path = osp.join(out_dir, "best_model.pt")
-    full_result = train_model_phase(
-        model,
-        data["train_list"],
-        data,
-        make_optimizer(model, args),
-        dst_pool,
+    reusable_full = load_reusable_no_retrain_full(
         args,
-        device,
-        num_rels,
-        num_nodes,
-        phase="full",
-        num_epochs=args.num_epochs,
-        select_with_val=True,
-        best_path=best_path,
+        required_modes=("val", "test") if getattr(args, "eval_test", True) else ("val",),
     )
-    model = full_result["model"]
-    best_epoch = max(1, int(full_result["best_epoch"]))
-    best_val_score = float(full_result["best_val_score"])
-    best_val_metrics = full_result["best_val_metrics"]
+    if reusable_full is not None:
+        print(
+            f"[TimeTKG] reusing full-train model and val/test scores from "
+            f"{reusable_full['dir']}",
+            flush=True,
+        )
+        state = torch.load(reusable_full["best_model_path"], map_location=device)
+        model.load_state_dict(state)
+        shutil.copy2(reusable_full["best_model_path"], best_path)
+        reused_metrics = reusable_full["metrics"]
+        best_epoch = max(1, int(reused_metrics.get("best_epoch", 1)))
+        best_val_score = float(
+            reused_metrics.get(
+                "best_val_selection",
+                reused_metrics.get(f"val_{selection_metric}", reused_metrics.get("val_mrr", 0.0)),
+            )
+        )
+        best_val_metrics = {
+            "mrr": float(reused_metrics.get("best_val_mrr", reused_metrics.get("val_mrr", 0.0))),
+            "hit10": float(reused_metrics.get("best_val_hit10", reused_metrics.get("val_hit10", 0.0))),
+        }
+        full_result = {
+            "model": model,
+            "best_epoch": int(best_epoch),
+            "best_val_score": float(best_val_score),
+            "best_val_metrics": best_val_metrics,
+            "train_time_sec": float(reused_metrics.get("full_train_time_sec", reused_metrics.get("train_time_sec", 0.0))),
+            "train_peak_alloc_mb": float(reused_metrics.get("full_train_peak_alloc_mb", reused_metrics.get("train_peak_alloc_mb", 0.0))),
+            "train_peak_reserved_mb": float(reused_metrics.get("full_train_peak_reserved_mb", reused_metrics.get("train_peak_reserved_mb", 0.0))),
+        }
+    else:
+        full_result = train_model_phase(
+            model,
+            data["train_list"],
+            data,
+            make_optimizer(model, args),
+            dst_pool,
+            args,
+            device,
+            num_rels,
+            num_nodes,
+            phase="full",
+            num_epochs=args.num_epochs,
+            select_with_val=True,
+            best_path=best_path,
+        )
+        model = full_result["model"]
+        best_epoch = max(1, int(full_result["best_epoch"]))
+        best_val_score = float(full_result["best_val_score"])
+        best_val_metrics = full_result["best_val_metrics"]
 
     train_metrics = None
     oof_result = None
@@ -3232,42 +3342,52 @@ def main(args):
                 torch.cuda.empty_cache()
             model.to(device)
 
-    final_store = warmup_train_history(data["train_list"], args, num_nodes)
-    final_val_metrics = evaluate_split(
-        model,
-        data["val_list"],
-        final_store,
-        data,
-        args,
-        device,
-        num_rels,
-        num_nodes,
-        mode="val",
-        out_dir=out_dir,
-        write_scores=True,
-    )
     test_metrics = None
     infer_peak_alloc = 0.0
     infer_peak_reserved = 0.0
     infer_time = 0.0
-    if getattr(args, "eval_test", True):
-        reset_cuda_peak(device)
-        test_metrics = evaluate_split(
+    if reusable_full is not None:
+        for mode in ("val", "test") if getattr(args, "eval_test", True) else ("val",):
+            copy_score_store(reusable_full["dir"], out_dir, mode)
+        final_val_metrics = unprefix_saved_metrics(reusable_full["metrics"], "val")
+        if getattr(args, "eval_test", True):
+            test_metrics = unprefix_saved_metrics(reusable_full["metrics"], "test")
+        infer_time = float(reusable_full["metrics"].get("infer_time_sec", 0.0))
+        infer_peak_alloc = float(reusable_full["metrics"].get("infer_peak_alloc_mb", 0.0))
+        infer_peak_reserved = float(reusable_full["metrics"].get("infer_peak_reserved_mb", 0.0))
+    else:
+        final_store = warmup_train_history(data["train_list"], args, num_nodes)
+        final_val_metrics = evaluate_split(
             model,
-            data["test_list"],
+            data["val_list"],
             final_store,
             data,
             args,
             device,
             num_rels,
             num_nodes,
-            mode="test",
+            mode="val",
             out_dir=out_dir,
             write_scores=True,
-            measure_model_forward=True,
         )
-        infer_peak_alloc, infer_peak_reserved = cuda_peak_mb(device)
-        infer_time = float(test_metrics.get("profile", {}).get("eval_model_forward_time", 0.0))
+        if getattr(args, "eval_test", True):
+            reset_cuda_peak(device)
+            test_metrics = evaluate_split(
+                model,
+                data["test_list"],
+                final_store,
+                data,
+                args,
+                device,
+                num_rels,
+                num_nodes,
+                mode="test",
+                out_dir=out_dir,
+                write_scores=True,
+                measure_model_forward=True,
+            )
+            infer_peak_alloc, infer_peak_reserved = cuda_peak_mb(device)
+            infer_time = float(test_metrics.get("profile", {}).get("eval_model_forward_time", 0.0))
     train_time = float(full_result["train_time_sec"])
     train_peak_alloc = float(full_result["train_peak_alloc_mb"])
     train_peak_reserved = float(full_result["train_peak_reserved_mb"])
@@ -3328,6 +3448,8 @@ def main(args):
         "full_train_time_sec": float(full_result["train_time_sec"]),
         "full_train_peak_alloc_mb": float(full_result["train_peak_alloc_mb"]),
         "full_train_peak_reserved_mb": float(full_result["train_peak_reserved_mb"]),
+        "reused_no_retrain_full": bool(reusable_full is not None),
+        "reused_no_retrain_full_dir": reusable_full["dir"] if reusable_full is not None else "",
     }
     if oof_result is not None:
         metrics.update(
