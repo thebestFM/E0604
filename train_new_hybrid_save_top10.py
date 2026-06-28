@@ -277,8 +277,15 @@ def make_out_dir(args, inputs):
             "hybrid_select_split": args.hybrid_select_split,
             "structure_param_presets": args.structure_param_presets,
             "hybrid_param_presets": args.hybrid_param_presets,
+            "hybrid_preset_indices": args.hybrid_preset_indices,
             "max_structure_configs": args.max_structure_configs,
             "max_time_configs": args.max_time_configs,
+            "component_splits": args.component_splits,
+            "skip_time_score_check": args.skip_time_score_check,
+            "skip_component_metrics": args.skip_component_metrics,
+            "skip_save_top10": args.skip_save_top10,
+            "max_hybrid_train_queries": args.max_hybrid_train_queries,
+            "hybrid_train_query_stride": args.hybrid_train_query_stride,
             "structure_preset_hash": stable_hash(STRUCTURE_PARAM_PRESETS, length=10),
             "hybrid_preset_hash": stable_hash(HYBRID_PARAM_PRESETS, length=10),
             "focus_metric": args.focus_metric,
@@ -293,15 +300,55 @@ def make_out_dir(args, inputs):
     return osp.join(args.output_root, args.dataset, f"seed{args.seed}", f"save_top10_{h}")
 
 
-def require_time_scores(time_dir, label):
+def require_time_scores(time_dir, label, splits=("train", "val", "test")):
     missing = []
-    for split in ("train", "val", "test"):
+    for split in splits:
         for suffix in ("pos.npy", "neg.npz", "valid_lens.npy", "meta.json"):
             path = osp.join(time_dir, f"{split}_{suffix}")
             if not osp.isfile(path):
                 missing.append(path)
     if missing:
         raise FileNotFoundError(f"{label} missing time score files, first missing: {missing[0]}")
+
+
+def parse_component_splits(args):
+    raw = str(getattr(args, "component_splits", "") or "").strip()
+    if raw:
+        splits = [x.strip() for x in raw.split(",") if x.strip()]
+    else:
+        splits = ["train", str(args.hybrid_select_split), "test"]
+    ordered = []
+    for split in splits:
+        if split not in ("train", "val", "test"):
+            raise ValueError("--component_splits entries must be train,val,test")
+        if split not in ordered:
+            ordered.append(split)
+    for split in ("train", str(args.hybrid_select_split), "test"):
+        if split not in ordered:
+            ordered.append(split)
+    return ordered
+
+
+def selected_hybrid_presets(args):
+    raw = str(getattr(args, "hybrid_preset_indices", "") or "").strip()
+    if not raw:
+        return [
+            (idx, params)
+            for idx, params in enumerate(HYBRID_PARAM_PRESETS[: int(args.hybrid_param_presets)], start=1)
+        ]
+    indices = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        idx = int(item)
+        if idx <= 0 or idx > len(HYBRID_PARAM_PRESETS):
+            raise ValueError(f"--hybrid_preset_indices contains invalid preset index {idx}")
+        if idx not in indices:
+            indices.append(idx)
+    if not indices:
+        raise ValueError("--hybrid_preset_indices did not contain any preset index")
+    return [(idx, HYBRID_PARAM_PRESETS[idx - 1]) for idx in indices]
 
 
 def train_best_rescue_hybrid(data, sargs, args, device, out_dir, struct_id, time_run, component_dir):
@@ -326,6 +373,8 @@ def train_best_rescue_hybrid(data, sargs, args, device, out_dir, struct_id, time
         min_pos_rank=int(args.rescue_min_pos_rank),
         max_pos_rank=int(args.rescue_max_pos_rank),
         include_top10=include_top10,
+        max_queries=int(args.max_hybrid_train_queries),
+        query_stride=int(args.hybrid_train_query_stride),
     )
     print(
         f"[SaveTop10][rescue] train rows={train_info['rows']} queries={train_info['queries']} "
@@ -336,7 +385,7 @@ def train_best_rescue_hybrid(data, sargs, args, device, out_dir, struct_id, time
     best = None
     records = []
     select_split = str(args.hybrid_select_split)
-    for idx, params in enumerate(HYBRID_PARAM_PRESETS[: int(args.hybrid_param_presets)], start=1):
+    for idx, params in selected_hybrid_presets(args):
         print(f"[SaveTop10][rescue] preset {idx} params={params}", flush=True)
         model = fit_lgbm_ranker(
             X_train,
@@ -386,19 +435,24 @@ def train_best_rescue_hybrid(data, sargs, args, device, out_dir, struct_id, time
     pair_id = f"{struct_id}__{time_run['id']}__rescue_top{int(args.rescue_topk)}"
     model_path = osp.join(out_dir, "rescue_models", f"{pair_id}.txt")
     save_lgbm_model(best["model"], model_path)
-    top10_path = osp.join(out_dir, "top10", f"{pair_id}.test_top10.jsonl")
-    test_metrics = evaluate_rescue_hybrid_model(
-        data,
-        "test",
-        sargs,
-        rescue_feature_builder,
-        best["model"],
-        time_dir,
-        device,
-        int(args.rescue_topk),
-        component_root=component_dir,
-        save_top10_path=top10_path,
-    )
+    top10_path = None
+    if str(select_split) == "test" and bool(args.skip_save_top10):
+        test_metrics = best["record"]["selection_metrics"]
+    else:
+        if not bool(args.skip_save_top10):
+            top10_path = osp.join(out_dir, "top10", f"{pair_id}.test_top10.jsonl")
+        test_metrics = evaluate_rescue_hybrid_model(
+            data,
+            "test",
+            sargs,
+            rescue_feature_builder,
+            best["model"],
+            time_dir,
+            device,
+            int(args.rescue_topk),
+            component_root=component_dir,
+            save_top10_path=top10_path,
+        )
     print(
         f"[SaveTop10][rescue] best pair={pair_id} test {format_metrics(test_metrics)} "
         f"stats={test_metrics.get('rescue_stats')} top10={top10_path}",
@@ -454,6 +508,12 @@ def validate_args(args, inputs):
         raise ValueError("preset counts must be > 0")
     if int(args.max_structure_configs) <= 0 or int(args.max_time_configs) <= 0:
         raise ValueError("max config counts must be > 0")
+    if int(args.max_hybrid_train_queries) < 0:
+        raise ValueError("--max_hybrid_train_queries must be >= 0")
+    if int(args.hybrid_train_query_stride) <= 0:
+        raise ValueError("--hybrid_train_query_stride must be > 0")
+    selected_hybrid_presets(args)
+    parse_component_splits(args)
     if int(args.num_threads) <= 0:
         raise ValueError("--num_threads must be > 0")
     if int(args.source_join_threads) < 0:
@@ -486,13 +546,17 @@ def run(args):
     describe_loaded_data(data, prefix="[SaveTop10]")
 
     resolved_time_runs = []
+    component_splits = parse_component_splits(args)
     for raw in time_runs(inputs, args.dataset):
         tr = copy.deepcopy(raw)
         tr["dir"] = resolve_time_dir(tr["dir"], args.time_root)
-        require_time_scores(tr["dir"], f"time {tr['id']}")
-        test_metrics = evaluate_score_store(tr["dir"], data, "test", SimpleNamespace(query_batch_size=args.query_batch_size))
-        tr["computed_test_metrics"] = test_metrics
-        print(f"[SaveTop10][time] {tr['id']} test {format_metrics(test_metrics)} dir={tr['dir']}", flush=True)
+        require_time_scores(tr["dir"], f"time {tr['id']}", splits=component_splits)
+        if bool(args.skip_time_score_check):
+            print(f"[SaveTop10][time] {tr['id']} score-check skipped dir={tr['dir']}", flush=True)
+        else:
+            test_metrics = evaluate_score_store(tr["dir"], data, "test", SimpleNamespace(query_batch_size=args.query_batch_size))
+            tr["computed_test_metrics"] = test_metrics
+            print(f"[SaveTop10][time] {tr['id']} test {format_metrics(test_metrics)} dir={tr['dir']}", flush=True)
         resolved_time_runs.append(tr)
 
     structure_records = []
@@ -509,13 +573,19 @@ def run(args):
             device,
             out_dir,
             struct_id,
+            splits=component_splits,
+            compute_metrics=not bool(args.skip_component_metrics),
         )
-        raw_test = component_metrics["splits"]["test"]["metrics"]["structure_raw"]
-        print(
-            f"[SaveTop10][structure_raw] struct={struct_id} test {format_metrics(raw_test)} "
-            f"component_scores={component_dir}",
-            flush=True,
-        )
+        raw_test = None
+        if not bool(args.skip_component_metrics):
+            raw_test = component_metrics["splits"]["test"]["metrics"]["structure_raw"]
+            print(
+                f"[SaveTop10][structure_raw] struct={struct_id} test {format_metrics(raw_test)} "
+                f"component_scores={component_dir}",
+                flush=True,
+            )
+        else:
+            print(f"[SaveTop10][structure_raw] struct={struct_id} metrics=skipped component_scores={component_dir}", flush=True)
         struct_record = {
             "id": struct_id,
             "config": cfg,
@@ -523,7 +593,8 @@ def run(args):
         }
         struct_record["component_score_dir"] = component_dir
         struct_record["component_metrics"] = component_metrics
-        struct_record["train_new_structure_style_test_metrics"] = raw_test
+        if raw_test is not None:
+            struct_record["train_new_structure_style_test_metrics"] = raw_test
         struct_record["elapsed_s"] = time.time() - t0
         structure_records.append(struct_record)
         for tr in resolved_time_runs[: int(args.max_time_configs)]:
@@ -593,7 +664,14 @@ def parse_args():
     parser.add_argument("--focus_metric", default="H10")
     parser.add_argument("--structure_param_presets", type=int, default=3)
     parser.add_argument("--hybrid_param_presets", type=int, default=10)
+    parser.add_argument("--hybrid_preset_indices", default="")
     parser.add_argument("--hybrid_select_split", choices=("val", "test"), default="test")
+    parser.add_argument("--component_splits", default="")
+    parser.add_argument("--skip_time_score_check", action="store_true", default=False)
+    parser.add_argument("--skip_component_metrics", action="store_true", default=False)
+    parser.add_argument("--skip_save_top10", action="store_true", default=False)
+    parser.add_argument("--max_hybrid_train_queries", type=int, default=0)
+    parser.add_argument("--hybrid_train_query_stride", type=int, default=1)
     parser.add_argument("--rescue_topk", type=int, default=100)
     parser.add_argument("--rescue_min_pos_rank", type=int, default=1)
     parser.add_argument("--rescue_max_pos_rank", type=int, default=100)

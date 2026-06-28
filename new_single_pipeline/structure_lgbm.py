@@ -628,50 +628,66 @@ def component_score_root(out_dir, struct_id):
     return osp.join(out_dir, "component_scores", str(struct_id))
 
 
-def save_component_score_stores(data, args, device, out_dir, struct_id):
+def save_component_score_stores(data, args, device, out_dir, struct_id, splits=None, compute_metrics=True):
     root = ensure_dir(component_score_root(out_dir, struct_id))
+    if splits is None:
+        splits = ("train", "val", "test")
+    splits = tuple(dict.fromkeys(str(s) for s in splits))
+    compute_metrics = bool(compute_metrics)
     metrics_path = osp.join(root, "metrics.json")
     expected = [
         osp.join(root, split, name, f"{split}_{suffix}")
-        for split in ("train", "val", "test")
+        for split in splits
         for name in COMPONENT_SCORE_NAMES
         for suffix in ("pos.npy", "neg.npz", "valid_lens.npy", "meta.json")
     ]
     if osp.isfile(metrics_path) and all(osp.isfile(path) for path in expected):
         with open(metrics_path, "r", encoding="utf-8") as f:
             metrics = json.load(f)
-        print(f"[ComponentScores] cache hit struct={struct_id} -> {root}", flush=True)
-        return root, metrics
-    metrics = {"format": "new_structure_component_scores_v1", "struct_id": str(struct_id), "splits": {}}
-    for split in ("train", "val", "test"):
+        cached_splits = set(metrics.get("splits", {}).keys())
+        if set(splits).issubset(cached_splits):
+            print(f"[ComponentScores] cache hit struct={struct_id} splits={','.join(splits)} -> {root}", flush=True)
+            return root, metrics
+    metrics = {
+        "format": "new_structure_component_scores_v1",
+        "struct_id": str(struct_id),
+        "compute_metrics": compute_metrics,
+        "splits": {},
+    }
+    for split in splits:
         split_dir = ensure_dir(osp.join(root, split))
         writers = {
             name: ScoreWriter(ensure_dir(osp.join(split_dir, name)), split)
             for name in COMPONENT_SCORE_NAMES
         }
-        sums = {name: {} for name in COMPONENT_SCORE_NAMES}
+        sums = {name: {} for name in COMPONENT_SCORE_NAMES} if compute_metrics else None
         rows = 0
-        for block in iter_structure_blocks(data, split, args, StructureFeatureBuilder(data["num_rels"]), device):
+        for block in iter_component_blocks(data, split, args, device):
             neg_mask = block.valid[:, 1:]
             for name in COMPONENT_SCORE_NAMES:
                 score = block.scores[name]
                 pos = score[:, :1]
                 neg = score[:, 1:]
                 writers[name].write_batch(pos, neg, neg_mask)
-                add_metric_sums(sums[name], compute_ranking_metric_sums(pos, neg, neg_mask))
+                if compute_metrics:
+                    add_metric_sums(sums[name], compute_ranking_metric_sums(pos, neg, neg_mask))
             rows += int(block.valid.shape[0])
         split_metrics = {}
         for name in COMPONENT_SCORE_NAMES:
             writers[name].close()
-            m = finalize_metric_sums(sums[name])
-            m["num_queries"] = int(sums[name].get("count", 0))
-            split_metrics[name] = m
+            if compute_metrics:
+                m = finalize_metric_sums(sums[name])
+                m["num_queries"] = int(sums[name].get("count", 0))
+                split_metrics[name] = m
         metrics["splits"][split] = {"rows": int(rows), "metrics": split_metrics}
-        print(
-            f"[ComponentScores] struct={struct_id} split={split} rows={rows} "
-            f"structure_raw {format_metrics(split_metrics['structure_raw'])}",
-            flush=True,
-        )
+        if compute_metrics:
+            print(
+                f"[ComponentScores] struct={struct_id} split={split} rows={rows} "
+                f"structure_raw {format_metrics(split_metrics['structure_raw'])}",
+                flush=True,
+            )
+        else:
+            print(f"[ComponentScores] struct={struct_id} split={split} rows={rows} metrics=skipped", flush=True)
     with open(osp.join(root, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
     return root, metrics
@@ -1268,6 +1284,8 @@ def build_rescue_hybrid_matrix(
     min_pos_rank=1,
     max_pos_rank=100,
     include_top10=True,
+    max_queries=0,
+    query_stride=1,
 ):
     X_parts = []
     y_parts = []
@@ -1277,10 +1295,16 @@ def build_rescue_hybrid_matrix(
     skipped_pos_after_topk = 0
     preserve_queries = 0
     rescue_queries = 0
+    eligible_queries = 0
+    sampled_out_queries = 0
+    max_queries = int(max_queries or 0)
+    query_stride = max(1, int(query_stride or 1))
     for block in iter_rescue_blocks(data, split, args, rescue_feature_builder, time_dir, device, component_root):
         selected, ranks = rescue_topk_mask(block.scores["structure_raw"], block.valid, topk)
         pos_ranks = ranks[:, 0]
         for row in range(selected.shape[0]):
+            if max_queries > 0 and queries >= max_queries:
+                break
             pos_rank = int(pos_ranks[row])
             if pos_rank > int(max_pos_rank):
                 skipped_pos_after_topk += 1
@@ -1290,6 +1314,10 @@ def build_rescue_hybrid_matrix(
             cols = np.flatnonzero(selected[row])
             if len(cols) <= 1 or 0 not in cols:
                 skipped_pos_after_topk += 1
+                continue
+            eligible_queries += 1
+            if (eligible_queries - 1) % query_stride != 0:
+                sampled_out_queries += 1
                 continue
             labels = np.zeros(len(cols), dtype=np.float32)
             labels[int(np.flatnonzero(cols == 0)[0])] = 1.0
@@ -1302,6 +1330,8 @@ def build_rescue_hybrid_matrix(
                 preserve_queries += 1
             else:
                 rescue_queries += 1
+        if max_queries > 0 and queries >= max_queries:
+            break
     if not X_parts:
         raise RuntimeError(f"no rescue hybrid rows built for split={split}")
     positives = int(np.sum(np.concatenate(y_parts) > 0.0))
@@ -1325,6 +1355,10 @@ def build_rescue_hybrid_matrix(
             "preserve_queries": int(preserve_queries),
             "rescue_queries": int(rescue_queries),
             "skipped_pos_after_topk": int(skipped_pos_after_topk),
+            "eligible_queries": int(eligible_queries),
+            "sampled_out_queries": int(sampled_out_queries),
+            "max_queries": int(max_queries),
+            "query_stride": int(query_stride),
         },
     )
 
