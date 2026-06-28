@@ -295,9 +295,10 @@ def _score_dsh_candidates(keys, values, rows, pos_obj, neg_samples, pos_out, neg
 
 
 class DirectSingleHopScorer:
-    def __init__(self, num_rels, decay_direct=1.0, max_time_span=None):
+    def __init__(self, num_rels, decay_direct=1.0, max_time_span=None, log_bucket_stats=False):
         self.num_rels = int(num_rels)
         self.decay_direct = float(decay_direct)
+        self.log_bucket_stats = bool(log_bucket_stats)
         self.rel_shift = 10 ** int(math.ceil(math.log10(self.num_rels + 1)))
         self.V_sr = {}
         self.V_sr_sum = {}
@@ -632,7 +633,7 @@ class DirectSingleHopScorer:
 
         for sr in dirty:
             self._mark_dirty(sr)
-        if stats['cleared_buckets']:
+        if stats['cleared_buckets'] and self.log_bucket_stats:
             print(
                 f'[DSH-info] bucket_lazy update_state: cleared stale/invalid buckets={stats["cleared_buckets"]} '
                 f'entries={stats["cleared_entries"]} max_rel_exp={stats["max_rel_exp"]:.3g} '
@@ -3693,6 +3694,7 @@ def main(args):
         num_rels=data['num_rels'],
         decay_direct=args.decay_direct,
         max_time_span=max_t_norm,
+        log_bucket_stats=bool(getattr(args, 'dsh_log_bucket_stats', False)),
     )
     args.dsh_decay_mode = direct_scorer.decay_mode
     args.dsh_max_time_span = max_t_norm
@@ -3737,6 +3739,7 @@ def parse_args():
     parser.add_argument('--max_events_in_single_batch', type=int, default=20000)
     parser.add_argument('--source_join_threads', type=int, default=0)
     parser.add_argument('--source_join_log_batches', type=int, default=0)
+    parser.add_argument('--dsh_log_bucket_stats', action='store_true', default=False)
     parser.add_argument('--close_update_backward', action='store_true', default=False)
     parser.add_argument('--dict_mode', choices=('tag_sum', 'tag_max', 'per_rel'), default='tag_sum')
     parser.add_argument('--shared_w', choices=('dual_msim', 'cross_msim', 'unweighted'), default='dual_msim')

@@ -235,6 +235,7 @@ class StructureComponentRuntime:
             data["num_rels"],
             decay_direct=float(args.decay_direct),
             max_time_span=max_t_norm,
+            log_bucket_stats=bool(getattr(args, "dsh_log_bucket_stats", False)),
         )
         self.predictor, self.semantic_updater, self.logic_updater = tns.build_runtime(
             args,

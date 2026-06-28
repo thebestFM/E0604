@@ -247,6 +247,7 @@ def make_structure_args(args, cfg, common):
             "query_batch_size": int(args.query_batch_size),
             "source_join_threads": int(args.source_join_threads),
             "source_join_log_batches": int(args.source_join_log_batches),
+            "dsh_log_bucket_stats": bool(args.dsh_log_bucket_stats),
             "b_cfg": BConfig(
                 mode=args.b_mode,
                 binary_unseen=float(args.b_binary_unseen),
@@ -585,6 +586,7 @@ def parse_args():
     parser.add_argument("--query_batch_size", type=int, default=64)
     parser.add_argument("--source_join_threads", type=int, default=60)
     parser.add_argument("--source_join_log_batches", type=int, default=0)
+    parser.add_argument("--dsh_log_bucket_stats", action="store_true", default=False)
     parser.add_argument("--structure_train_topk", type=int, default=100)
     parser.add_argument("--hybrid_train_topk", type=int, default=100)
     parser.add_argument("--structure_metric", default="H10")
